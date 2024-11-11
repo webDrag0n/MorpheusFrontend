@@ -8,13 +8,40 @@
 
 ![Morpheus关键组件](README.assets/Morpheus关键组件.png)
 
-## How to Run
+## How to Deploy
 
 Clone this repository and open with unity 2022 LTS.
 
-Then deploy Morpheus Backend according to backend README:
+Then deploy Morpheus Backend in a `Ubuntu 22.04` system according to backend README:
 
 [Morpheus Backend GitHub Repo](https://github.com/webDrag0n/MorpheusBackend)
+
+## How to Run
+
+After deploying both Morpheus Frontend and Backend, you should be able to run our demo test acse.
+
+Launch Morpheus Backend docker environment and navigate to root directory of Morpheus Backend
+
+execute:
+
+```bash
+colcon build
+source install/setup.sh
+bash start_all.sh
+```
+
+Then open the Morpheus Frontend Unity project, open `Demo` scene in `Assets/Scenes` folder, press play button.
+
+You shoud now be seeing the Unitree h1 robot moving.
+
+![image-20241111155641895](H:\ProjectsPerformance\MorpheusFrontend\README.assets\image-20241111155641895.png)
+
+You can further execute:
+```bash
+bash see_h1_status.sh
+```
+
+to see the response from simulation environment containing position and rotation.
 
 ## Status
 
@@ -23,9 +50,9 @@ Then deploy Morpheus Backend according to backend README:
 ✅ MuJoCo
 
 	✅ Unity端插件部署完成
- 
+	 
 	✅ Unitree MuJoCo部署完成
- 
+
 ✅ Unitree h1物理仿真效果测试完成
 
 ✅ Unitree sdk2，Unitree sdk2 python
@@ -35,47 +62,47 @@ Then deploy Morpheus Backend according to backend README:
 ✅ ROS2 通信
 
 	✅ ROS Plugin：Unity-Robotics-Hub
- 
+	 
 	✅ ROS2（foxy，humble）与Unity通信完成测试
- 
+	 
 	✅ ROS2 控制信号控制环境仿真机器人
- 
+	 
 	✅ ROS2 仿真环境机器人状态回传
- 
+
 ▶️ ROS2 传感器仿真
 
 	⏸️ 相机（自然有，只需要接口）
- 
+	 
 	✅ Lidar传感器
- 
+	 
 	⏸️ IMU（简单，只需要接口）
- 
+
 ▶️ Isaac Sim RL Sim2Sim测试
 
 	✅ 环境部分部署完成
- 
+	 
 	▶️ 迁移Isaac Gym代码至本平台
- 
+
 ▶️ Hololens 2 连接Unity
 
 	✅ Microsoft-MRTK3.0 OpenXR技术栈部署完成
- 
+	 
 	✅ Hololens 2连接Unity
- 
+	 
 	⏸️ Hololens 2手部输入反控仿真物体
- 
+	 
 	⏸️ Hololens 2手部动捕信号回传
- 
+	 
 	⏸️ Hololens 2相机信号回传
- 
+
 ⏸️ 仿真数据录制模块
 
 	Unitree H1
- 
+	 
 	Unitree Go2
- 
+	 
 	四旋翼无人机
- 
+
 ⏸️ Robomaster机器人MuJoCo模型
 
 ⏸️ Unity输出语义分割图
