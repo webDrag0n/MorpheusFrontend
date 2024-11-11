@@ -30,7 +30,17 @@ source install/setup.sh
 bash start_h1.sh
 ```
 
-Then open the Morpheus Frontend Unity project, open `Demo` scene in `Assets/Scenes` folder, press play button.
+Then open the Morpheus Frontend Unity project, open `Demo` scene in `Assets/Scenes` folder
+
+Open ROS Settings window
+
+![image-20241111164632377](README.assets/image-20241111164632377.png)
+
+Set ROS IP Address as your `docker host machine's IP`
+
+![image-20241111164801632](README.assets/image-20241111164801632.png)
+
+Press play button.
 
 You shoud now be seeing the Unitree h1 robot moving.
 
