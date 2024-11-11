@@ -34,7 +34,7 @@ Then open the Morpheus Frontend Unity project, open `Demo` scene in `Assets/Scen
 
 You shoud now be seeing the Unitree h1 robot moving.
 
-![image-20241111155641895](README.assets\image-20241111155641895.png)
+![image-20241111155641895](README.assets/image-20241111155641895.png)
 
 You can further execute:
 ```bash
