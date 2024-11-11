@@ -217,7 +217,7 @@
       "url": "https://packages.unity.com"
     },
     "org.mujoco": {
-      "version": "file:C:/Users/webDrag0n/Desktop/ProjectMorpheus/mujoco_unity_plugin",
+      "version": "file:../MujocoUnityPlugin",
       "depth": 0,
       "source": "local",
       "dependencies": {}
