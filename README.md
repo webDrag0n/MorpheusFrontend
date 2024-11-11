@@ -19,40 +19,68 @@ Then deploy Morpheus Backend according to backend README:
 ## Status
 
 - ## Roadmap
-	- ✅ MuJoCo
-		- Unity端插件部署完成
-	- ✅ [[Unitree MuJoCo]]
-		- 部署完成
-	- ✅ [[Unitree sdk2]] [[Unitree sdk2 python]]
-	- ✅ ML-Agent
-	- ✅ ROS Plugin：Unity-Robotics-Hub
-		- ROS2（foxy）与Unity通信完成测试
-	- ▶️ Isaac Sim RL Sim2Sim测试
-		- ✅ 环境部分部署完成
-		- ✅ 仿真环境机器人控制指令接收
-		- ▶️ 仿真环境机器人状态回传
-			- ROS2控制信号接收，状态信号发送
-	- ▶️ Hololens 2 连接Unity
-		- ✅ Microsoft-MRTK3.0 OpenXR技术栈部署完成
-		- ✅ Hololens 2连接Unity
-		- ⏸️ Hololens 2手部动捕信号回传
-		- ⏸️ Hololens 2相机信号回传
-	- ⏸️ Hololens 2手部输入反控仿真物体
-		- ⏸️ 手部及位置动捕数据
-			- ⏸️ 接收模块
-			- ⏸️ 录制模块
-		- ⏸️ Unity接收动捕+图像回传数据对齐
-	- ⏸️ 仿真数据录制模块
-		- Unitree H1
-		- Unitree Go2
-		- 四旋翼无人机
-	- ⏸️ Robomaster机器人MuJoCo模型
-	- ⏸️ Unity输出语义分割图
-		- ⏸️ SAM2？或者直接仿真直出
-	- ⏸️ 传感器仿真
-		- ⏸️ 相机（自然有，只需要接口）
-		- ⏸️ 激光雷达
-		- ⏸️ IMU（简单，只需要接口）
+
+✅ MuJoCo
+
+	✅ Unity端插件部署完成
+ 
+	✅ Unitree MuJoCo部署完成
+ 
+✅ Unitree h1物理仿真效果测试完成
+
+✅ Unitree sdk2，Unitree sdk2 python
+
+✅ ML-Agent
+
+✅ ROS2 通信
+
+	✅ ROS Plugin：Unity-Robotics-Hub
+ 
+	✅ ROS2（foxy，humble）与Unity通信完成测试
+ 
+	✅ ROS2 控制信号控制环境仿真机器人
+ 
+	✅ ROS2 仿真环境机器人状态回传
+ 
+▶️ ROS2 传感器仿真
+
+	⏸️ 相机（自然有，只需要接口）
+ 
+	✅ Lidar传感器
+ 
+	⏸️ IMU（简单，只需要接口）
+ 
+▶️ Isaac Sim RL Sim2Sim测试
+
+	✅ 环境部分部署完成
+ 
+	▶️ 迁移Isaac Gym代码至本平台
+ 
+▶️ Hololens 2 连接Unity
+
+	✅ Microsoft-MRTK3.0 OpenXR技术栈部署完成
+ 
+	✅ Hololens 2连接Unity
+ 
+	⏸️ Hololens 2手部输入反控仿真物体
+ 
+	⏸️ Hololens 2手部动捕信号回传
+ 
+	⏸️ Hololens 2相机信号回传
+ 
+⏸️ 仿真数据录制模块
+
+	Unitree H1
+ 
+	Unitree Go2
+ 
+	四旋翼无人机
+ 
+⏸️ Robomaster机器人MuJoCo模型
+
+⏸️ Unity输出语义分割图
+
+	⏸️ SAM2？或者直接仿真直出
 
 
 ## Contributors
