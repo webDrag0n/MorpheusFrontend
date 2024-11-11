@@ -27,7 +27,7 @@ execute:
 ```bash
 colcon build
 source install/setup.sh
-bash start_all.sh
+bash start_h1.sh
 ```
 
 Then open the Morpheus Frontend Unity project, open `Demo` scene in `Assets/Scenes` folder, press play button.
