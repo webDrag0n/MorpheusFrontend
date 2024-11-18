@@ -91,7 +91,7 @@ to see the response from simulation environment containing position and rotation
 
 	✅ 环境部分部署完成
 	 
-	▶️ 迁移Isaac Gym代码至本平台
+	▶️ Isaac Gym物理引擎接入
 
 ▶️ Hololens 2 连接Unity
 
@@ -99,11 +99,11 @@ to see the response from simulation environment containing position and rotation
 	 
 	✅ Hololens 2连接Unity
 	 
-	⏸️ Hololens 2手部输入反控仿真物体
+	▶️ Hololens 2手部输入反控仿真物体
 	 
-	⏸️ Hololens 2手部动捕信号回传
+	▶️ Hololens 2手部动捕信号回传
 	 
-	⏸️ Hololens 2相机信号回传
+	▶️ Hololens 2相机信号回传
 
 ⏸️ 仿真数据录制模块
 
