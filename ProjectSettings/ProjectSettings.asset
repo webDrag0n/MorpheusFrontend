@@ -46,7 +46,7 @@ PlayerSettings:
   defaultScreenHeight: 1080
   defaultScreenWidthWeb: 960
   defaultScreenHeightWeb: 600
-  m_StereoRenderingPath: 0
+  m_StereoRenderingPath: 2
   m_ActiveColorSpace: 1
   unsupportedMSAAFallback: 0
   m_SpriteBatchVertexThreshold: 300
@@ -79,7 +79,7 @@ PlayerSettings:
   androidAutoRotationBehavior: 1
   defaultIsNativeResolution: 1
   macRetinaSupport: 1
-  runInBackground: 1
+  runInBackground: 0
   captureSingleScreen: 0
   muteOtherAudioSources: 0
   Prepare IOS For Recording: 0
@@ -307,7 +307,7 @@ PlayerSettings:
   - m_BuildTarget: Switch
     m_GraphicsJobs: 1
   - m_BuildTarget: MetroSupport
-    m_GraphicsJobs: 1
+    m_GraphicsJobs: 0
   - m_BuildTarget: AppleTVSupport
     m_GraphicsJobs: 0
   - m_BuildTarget: BJMSupport
@@ -646,7 +646,9 @@ PlayerSettings:
   webGLMemoryGeometricGrowthCap: 96
   webGLPowerPreference: 2
   scriptingDefineSymbols:
-    Standalone: ROS2
+    Android: USE_INPUT_SYSTEM_POSE_CONTROL;USE_STICK_CONTROL_THUMBSTICKS
+    Standalone: ROS2;USE_INPUT_SYSTEM_POSE_CONTROL;USE_STICK_CONTROL_THUMBSTICKS
+    Windows Store Apps: USE_INPUT_SYSTEM_POSE_CONTROL;USE_STICK_CONTROL_THUMBSTICKS
   additionalCompilerArguments: {}
   platformArchitecture: {}
   scriptingBackend: {}
@@ -700,7 +702,12 @@ PlayerSettings:
   metroSplashScreenBackgroundColor: {r: 0.12941177, g: 0.17254902, b: 0.21568628, a: 1}
   metroSplashScreenUseBackgroundColor: 0
   syncCapabilities: 0
-  platformCapabilities: {}
+  platformCapabilities:
+    WindowsStoreApps:
+      SpatialPerception: True
+      InternetClient: True
+      WebCam: True
+      Microphone: True
   metroTargetDeviceFamilies: {}
   metroFTAName: 
   metroFTAFileTypes: []
@@ -753,7 +760,7 @@ PlayerSettings:
   hmiLogStartupTiming: 0
   hmiCpuConfiguration: 
   apiCompatibilityLevel: 6
-  activeInputHandler: 0
+  activeInputHandler: 2
   windowsGamepadBackendHint: 0
   cloudProjectId: 
   framebufferDepthMemorylessMode: 0
