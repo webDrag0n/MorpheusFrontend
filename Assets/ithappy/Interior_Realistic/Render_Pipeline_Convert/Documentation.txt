@@ -1,0 +1,22 @@
+Welcome! Our models initially come with URP shaders. Depending on the package you choose, we have also created custom shaders (water, glass, etc.) in Built-In, URP and HDRP variants.
+
+1. Package "URP_to_BuiltIn_source.unitypackage".
+For your convenience, we have created a .unitypackage called "URP_to_Built-In". This package automatically changes the shaders of all materials from URP to Built-In. To install this package:
+- Open your project in Unity.
+- Go to the Assets menu and open the "Render_Pipeline_Convert" folder.
+- Double click on the "URP_to_Built-In" file.
+- Click the "Import" button.
+After .unitypackage makes the changes to the materials it will change the URP shader to Built-In.
+
+2. Package "URP_to_HDRP_source.unitypackage".
+For your convenience, we have created a .unitypackage called "URP_to_HDRP". This package automatically changes the shaders of all materials from URP to HDRP. To install this package:
+- Open your project in Unity.
+- Go to the Assets menu and open the "Render_Pipeline_Convert" folder.
+- Double click on the "URP_to_HDRP" file.
+- Click the "Import" button.
+After .unitypackage makes the changes to the materials it will change the URP shader to HDRP.
+
+Conclusion
+We hope that this documentation will help you to easily customize our project to your needs. If you have any questions or problems, feel free to contact our support team on Discord.
+Discord - https://discord.com/invite/kkCcXBEB2V
+
