@@ -308,7 +308,7 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!1001 &552606191221629826
+--- !u!1001 &5724951219259100778
 PrefabInstance:
   m_ObjectHideFlags: 0
   serializedVersion: 2
@@ -316,59 +316,59 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 0}
     m_Modifications:
-    - target: {fileID: 911874205467185377, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
-      propertyPath: m_Name
-      value: robot_arm_simulation89
-      objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalPosition.x
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalPosition.y
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalPosition.z
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalRotation.w
       value: 1
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalRotation.x
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalRotation.y
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalRotation.z
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalEulerAnglesHint.x
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalEulerAnglesHint.y
       value: 0
       objectReference: {fileID: 0}
-    - target: {fileID: 7909243334148638369, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+    - target: {fileID: 2413053861162993231, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 4618447576117121039, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
+      propertyPath: m_Name
+      value: robot_arm_simulation89
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
     m_AddedComponents: []
-  m_SourcePrefab: {fileID: 100100000, guid: b404978807dde814cb5f1f78a183f64a, type: 3}
+  m_SourcePrefab: {fileID: 100100000, guid: 94cf0dea451ea9546a3719070207b8d1, type: 3}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
   m_Roots:
   - {fileID: 714396607}
   - {fileID: 477148640}
-  - {fileID: 552606191221629826}
+  - {fileID: 5724951219259100778}

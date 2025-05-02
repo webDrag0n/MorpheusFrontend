@@ -16,11 +16,11 @@ using Newtonsoft.Json;
 //}
 public class DeepSeekIntegration : MonoBehaviour
 {
-    // ÓÃÓÚ´æ´¢¶Ô»°ÀúÊ·
+    // ï¿½ï¿½ï¿½Ú´æ´¢ï¿½Ô»ï¿½ï¿½ï¿½Ê·
     private List<Dictionary<string, string>> messages = new List<Dictionary<string, string>>();
     void Start()
     {
-        // ³õÊ¼»¯ÏµÍ³ÏûÏ¢
+        // ï¿½ï¿½Ê¼ï¿½ï¿½ÏµÍ³ï¿½ï¿½Ï¢
         messages.Add(new Dictionary<string, string> { { "role", "system" }, { "content", "You are a helpful assistant." } });
     }
 
@@ -29,15 +29,15 @@ public class DeepSeekIntegration : MonoBehaviour
         string userMessage = "Please design a 4m x 6m kitchen for me, suppose each item takes a 1x1 square, output the result as a 2d array, each element is the name of the item, allow empty element, please output the 2d array only, with no explainations";
         //if (string.IsNullOrEmpty(userMessage)) return;
 
-        // Ìí¼ÓÓÃ»§ÏûÏ¢µ½¶Ô»°ÀúÊ·
+        // ï¿½ï¿½ï¿½ï¿½ï¿½Ã»ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½Ô»ï¿½ï¿½ï¿½Ê·
         messages.Add(new Dictionary<string, string> { { "role", "user" }, { "content", userMessage } });
-        // µ÷ÓÃ DeepSeek API
+        // ï¿½ï¿½ï¿½ï¿½ DeepSeek API
         StartCoroutine(CallDeepSeekAPI());
     }
 
     private IEnumerator CallDeepSeekAPI()
     {
-        // ´´½¨ÇëÇóÊý¾Ý
+        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
         var requestData = new
         {
             model = "deepseek-chat",
@@ -48,7 +48,7 @@ public class DeepSeekIntegration : MonoBehaviour
         string jsonData = JsonConvert.SerializeObject(requestData);
         Debug.Log(jsonData);
 
-        // ´´½¨ UnityWebRequest
+        // ï¿½ï¿½ï¿½ï¿½ UnityWebRequest
         UnityWebRequest request = new UnityWebRequest("https://api.deepseek.com/chat/completions", "POST");
         byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonData);
         request.uploadHandler = new UploadHandlerRaw(bodyRaw);
@@ -56,19 +56,19 @@ public class DeepSeekIntegration : MonoBehaviour
         request.SetRequestHeader("Content-Type", "application/json");
         request.SetRequestHeader("Authorization", "Bearer " + "sk-b9be58803d35454fb7102491b5c455ee");
 
-        // ·¢ËÍÇëÇó
+        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
         yield return request.SendWebRequest();
 
         if (request.result == UnityWebRequest.Result.Success)
         {
-            // ½âÎöÏìÓ¦
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¦
             var response = JsonConvert.DeserializeObject<DeepSeekResponse>(request.downloadHandler.text);
             string botMessage = response.choices[0].message.content;
 
-            // ÏÔÊ¾ÏìÓ¦
+            // ï¿½ï¿½Ê¾ï¿½ï¿½Ó¦
             Debug.Log("\nAI: " + botMessage);
 
-            // Ìí¼Ó AI ÏûÏ¢µ½¶Ô»°ÀúÊ·
+            // ï¿½ï¿½ï¿½ï¿½ AI ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½Ô»ï¿½ï¿½ï¿½Ê·
             messages.Add(new Dictionary<string, string> { { "role", "assistant" }, { "content", botMessage } });
         }
         else
