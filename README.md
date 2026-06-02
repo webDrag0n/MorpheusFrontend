@@ -2,9 +2,19 @@
 
 ## Introduction
 
-**本项目的目标是开发一个专注于人-机协同任务的机器人仿真环境**，集成ROS（Robot Operating System）、Unity和MuJoCo的仿真平台，具备高精度的物理仿真、灵活的环境建模、传感器模拟以及基于大语言模型的AI动作绑定和人机协作。通过容器化简化部署，并集成Hololens 2进行场景可视化和人体动作捕捉。该平台还支持通过照片生成场景并扩展类似场景，以及优化人机协作的数据集生成流程。
+还在苦恼于MuJoCo拿不出手的上世纪风格渲染吗？难道想要好看的Demo只能去用IsaacLab？我们也有相同的苦恼，因此基于[MuJoCo Unity Plugin](https://github.com/google-deepmind/mujoco/tree/main/unity)开发了Morpheus仿真平台，让Sim-2-Sim也能有拿得出手的Demo！
 
-![Morpheus愿景](README.assets/Morpheus愿景.png)
+**本项目的目标是开发一个简单易用并且渲染真实的MuJoCo仿真环境**，集成Unity渲染管线、MuJoCo物理仿真器、基于ROS（Robot Operating System）的机器人数据传输，具备逼真的图像渲染，与原生MuJoCo物理仿真、灵活的环境建模、传感器模拟等功能。
+
+未来还将进一步集成：
+	* 基于大语言模型的场景生成
+	* AI动作绑定和人机协作
+	* Hololens 2进行场景可视化和人体动作捕捉
+	* 通过照片生成场景并扩展类似场景
+	* 优化人机协作的数据集生成流程
+	...
+
+仿真效果与MuJoCo原生环境对比
 
 ![Morpheus关键组件](README.assets/Morpheus关键组件.png)
 
@@ -123,3 +133,7 @@ to see the response from simulation environment containing position and rotation
 ## Contributors
 
 @[webDrag0n](https://github.com/webDrag0n), @[Tsunami](https://github.com/panz1ha0)
+
+## Credits
+
+[MuJoCo Unity Plugin](https://github.com/google-deepmind/mujoco/tree/main/unity)

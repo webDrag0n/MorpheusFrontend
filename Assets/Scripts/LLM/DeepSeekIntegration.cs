@@ -34,7 +34,7 @@ public class DeepSeekIntegration : MonoBehaviour
 
     public void OnSendButtonClicked()
     {
-        string userMessage = "Please design a 4m x 6m kitchen for me, suppose each item takes a 1x1 square, output the result as a 2d array, each element is the name of the item, allow empty element, please output the 2d array only, with no explainations, you can choose object component from the following list: [oven,fridge,table,chair,cabinet], you can put multiple table/chair/cabinet in the kitchen, please only output the 2d array, with no explainations, no other text, no markdown or json format, no spaces between elements, no need to output string quote symbols, no need to output the array parenthese '[' and ']', just output the 2d array content";
+        string userMessage = "Please design a 4m x 6m kitchen, suppose each item takes a 1x1 square, output the result as a 2d array, each element is the name of the item, allow empty element, please output the 2d array only, with no explainations, you can choose object component from the following list: [oven,fridge,table,chair,cabinet], you can put multiple table/chair/cabinet in the kitchen, you can leave empty space in the kitchen, please only output the 2d array, with no explainations, no other text, no markdown or json format, no spaces between elements, no need to output string quote symbols, no need to output the array parenthese '[' and ']', just output the 2d array content";
         //if (string.IsNullOrEmpty(userMessage)) return;
 
         messages.Add(new Dictionary<string, string> { { "role", "user" }, { "content", userMessage } });

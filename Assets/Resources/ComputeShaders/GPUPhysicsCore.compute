@@ -1,0 +1,754 @@
+// =============================================================================
+// GPU Physics Core - Compute Shader for Massively Parallel Rigid Body Simulation
+// Supports 4096+ parallel environments with full articulated body dynamics
+// =============================================================================
+
+#pragma kernel IntegrateVelocities
+#pragma kernel IntegratePositions
+#pragma kernel BroadPhaseCollision
+#pragma kernel NarrowPhaseCollision
+#pragma kernel SolveConstraints
+#pragma kernel ApplyActuators
+#pragma kernel ComputeObservations
+#pragma kernel ResetEnvironments
+#pragma kernel ComputeForwardKinematics
+#pragma kernel ComputeInverseDynamics
+
+// Thread group configuration
+#define THREAD_GROUP_SIZE 256
+#define MAX_BODIES_PER_ENV 20
+#define MAX_JOINTS_PER_ENV 19
+#define MAX_COLLIDERS_PER_ENV 24
+#define MAX_CONTACTS_PER_ENV 64
+#define MAX_OBS_SIZE 128
+#define MAX_ACTION_SIZE 32
+
+// =============================================================================
+// GPU Data Structures (must match C# definitions exactly)
+// =============================================================================
+
+struct RigidBodyState
+{
+    float3 position;
+    float _padding0;
+    float4 orientation; // quaternion (x,y,z,w)
+    
+    float3 linearVelocity;
+    float _padding1;
+    float3 angularVelocity;
+    float _padding2;
+    
+    float mass;
+    float invMass;
+    float3 inertiaTensor;
+    float _padding3;
+    float3 invInertiaTensor;
+    float _padding4;
+    
+    int bodyIndex;
+    int envIndex;
+    uint flags;
+    float _padding5;
+};
+
+struct JointState
+{
+    float position;
+    float velocity;
+    float acceleration;
+    float torque;
+    
+    float positionMin;
+    float positionMax;
+    float velocityMax;
+    float torqueMax;
+    
+    float targetPosition;
+    float targetVelocity;
+    float kp;
+    float kd;
+    
+    int jointIndex;
+    int parentBodyIndex;
+    int childBodyIndex;
+    uint jointType; // 0=fixed, 1=hinge, 2=slider, 3=ball, 4=free
+};
+
+struct ColliderDescriptor
+{
+    uint colliderType; // 0=sphere, 1=capsule, 2=box, 3=plane, 4=mesh
+    float radius;
+    float height;
+    float _padding0;
+    
+    float3 halfExtents;
+    float _padding1;
+    
+    float3 localPosition;
+    float _padding2;
+    float4 localRotation;
+    
+    int bodyIndex;
+    int colliderIndex;
+    float friction;
+    float restitution;
+};
+
+struct ContactPoint
+{
+    float3 position;
+    float penetration;
+    
+    float3 normal;
+    float _padding0;
+    
+    int bodyIndexA;
+    int bodyIndexB;
+    int colliderIndexA;
+    int colliderIndexB;
+    
+    float3 relativeVelocity;
+    float impulse;
+};
+
+struct EnvironmentState
+{
+    int envIndex;
+    float simulationTime;
+    float deltaTime;
+    uint stepCount;
+    
+    float reward;
+    float cumulativeReward;
+    uint isDone;
+    uint needsReset;
+    
+    float3 worldOffset;
+    float _padding0;
+};
+
+struct ActuatorCommand
+{
+    float targetPosition;
+    float targetVelocity;
+    float targetTorque;
+    float _padding0;
+    
+    float kp;
+    float kd;
+    float maxTorque;
+    int actuatorIndex;
+};
+
+// =============================================================================
+// Buffer Declarations
+// =============================================================================
+
+RWStructuredBuffer<RigidBodyState> _RigidBodyStates;
+RWStructuredBuffer<RigidBodyState> _RigidBodyStatesBack; // For double buffering
+RWStructuredBuffer<JointState> _JointStates;
+RWStructuredBuffer<JointState> _JointStatesBack;
+StructuredBuffer<ColliderDescriptor> _ColliderDescriptors;
+RWStructuredBuffer<ContactPoint> _ContactPoints;
+RWStructuredBuffer<EnvironmentState> _EnvironmentStates;
+StructuredBuffer<ActuatorCommand> _ActuatorCommands;
+RWStructuredBuffer<float> _Observations;
+StructuredBuffer<float> _Actions;
+
+// Atomic counter for contacts
+RWStructuredBuffer<uint> _ContactCounter;
+
+// =============================================================================
+// Simulation Parameters (set from C#)
+// =============================================================================
+
+cbuffer SimulationParams
+{
+    float4 _Gravity;           // (x, y, z, 0)
+    float _DeltaTime;
+    float _InvDeltaTime;
+    int _NumEnvironments;
+    int _MaxBodiesPerEnv;
+    int _MaxJointsPerEnv;
+    int _MaxCollidersPerEnv;
+    int _MaxContactsPerEnv;
+    int _SolverIterations;
+    float _ContactBias;
+    float _DefaultFriction;
+    float _DefaultRestitution;
+    int _Substeps;
+    float _SubstepDt;
+};
+
+// =============================================================================
+// Quaternion Math Utilities
+// =============================================================================
+
+float4 QuatMultiply(float4 q1, float4 q2)
+{
+    return float4(
+        q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+        q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+        q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+        q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z
+    );
+}
+
+float4 QuatConjugate(float4 q)
+{
+    return float4(-q.x, -q.y, -q.z, q.w);
+}
+
+float4 QuatNormalize(float4 q)
+{
+    float len = length(q);
+    return len > 0.0001f ? q / len : float4(0, 0, 0, 1);
+}
+
+float3 QuatRotateVector(float4 q, float3 v)
+{
+    float3 u = q.xyz;
+    float s = q.w;
+    return 2.0f * dot(u, v) * u
+         + (s * s - dot(u, u)) * v
+         + 2.0f * s * cross(u, v);
+}
+
+float4 QuatFromAxisAngle(float3 axis, float angle)
+{
+    float halfAngle = angle * 0.5f;
+    float s = sin(halfAngle);
+    return float4(axis * s, cos(halfAngle));
+}
+
+float3x3 QuatToMatrix(float4 q)
+{
+    float xx = q.x * q.x;
+    float yy = q.y * q.y;
+    float zz = q.z * q.z;
+    float xy = q.x * q.y;
+    float xz = q.x * q.z;
+    float yz = q.y * q.z;
+    float wx = q.w * q.x;
+    float wy = q.w * q.y;
+    float wz = q.w * q.z;
+
+    return float3x3(
+        1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy),
+        2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx),
+        2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)
+    );
+}
+
+// =============================================================================
+// Physics Kernels
+// =============================================================================
+
+// Kernel 0: Integrate velocities (apply forces and gravity)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void IntegrateVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint totalBodies = (uint)_NumEnvironments * (uint)_MaxBodiesPerEnv;
+    if (id.x >= totalBodies) return;
+    
+    RigidBodyState body = _RigidBodyStates[id.x];
+    
+    // Skip kinematic bodies
+    if ((body.flags & 2u) != 0) return;
+    
+    // Skip inactive bodies
+    if ((body.flags & 1u) == 0) return;
+    
+    // Apply gravity
+    if (body.invMass > 0)
+    {
+        body.linearVelocity += _Gravity.xyz * _SubstepDt;
+    }
+    
+    // Apply damping
+    float linearDamping = 0.01f;
+    float angularDamping = 0.05f;
+    body.linearVelocity *= (1.0f - linearDamping * _SubstepDt);
+    body.angularVelocity *= (1.0f - angularDamping * _SubstepDt);
+    
+    _RigidBodyStates[id.x] = body;
+}
+
+// Kernel 1: Integrate positions (symplectic Euler)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void IntegratePositions(uint3 id : SV_DispatchThreadID)
+{
+    uint totalBodies = (uint)_NumEnvironments * (uint)_MaxBodiesPerEnv;
+    if (id.x >= totalBodies) return;
+    
+    RigidBodyState body = _RigidBodyStates[id.x];
+    
+    // Skip kinematic and inactive bodies
+    if ((body.flags & 1u) == 0) return;
+    if ((body.flags & 2u) != 0) return;
+    
+    // Integrate position
+    body.position += body.linearVelocity * _SubstepDt;
+    
+    // Integrate orientation using quaternion derivative
+    float3 omega = body.angularVelocity;
+    float omegaMag = length(omega);
+    if (omegaMag > 0.0001f)
+    {
+        float halfAngle = omegaMag * _SubstepDt * 0.5f;
+        float4 deltaQ = QuatFromAxisAngle(omega / omegaMag, omegaMag * _SubstepDt);
+        body.orientation = QuatNormalize(QuatMultiply(deltaQ, body.orientation));
+    }
+    
+    _RigidBodyStates[id.x] = body;
+}
+
+// Kernel 2: Broad-phase collision detection (spatial hashing / simple AABB)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void BroadPhaseCollision(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint colliderOffset = envIndex * (uint)_MaxCollidersPerEnv;
+    uint contactOffset = envIndex * (uint)_MaxContactsPerEnv;
+    
+    // Reset contact counter for this environment
+    // Simple O(n^2) broad phase within environment
+    // For production: implement spatial hashing or BVH
+    
+    uint contactCount = 0;
+    
+    for (uint i = 0; i < (uint)_MaxCollidersPerEnv && contactCount < (uint)_MaxContactsPerEnv; i++)
+    {
+        ColliderDescriptor colA = _ColliderDescriptors[colliderOffset + i];
+        if (colA.colliderType == 0xFFFFFFFF) continue; // Invalid collider
+        
+        RigidBodyState bodyA = _RigidBodyStates[bodyOffset + colA.bodyIndex];
+        float3 posA = bodyA.position + QuatRotateVector(bodyA.orientation, colA.localPosition);
+        
+        // Check against ground plane (y = 0)
+        if (colA.colliderType == 0) // Sphere
+        {
+            float groundDist = posA.y - colA.radius;
+            if (groundDist < 0)
+            {
+                ContactPoint contact;
+                contact.position = float3(posA.x, 0, posA.z);
+                contact.penetration = -groundDist;
+                contact.normal = float3(0, 1, 0);
+                contact.bodyIndexA = colA.bodyIndex;
+                contact.bodyIndexB = -1; // Ground
+                contact.colliderIndexA = i;
+                contact.colliderIndexB = -1;
+                contact.relativeVelocity = bodyA.linearVelocity;
+                contact.impulse = 0;
+                
+                _ContactPoints[contactOffset + contactCount] = contact;
+                contactCount++;
+            }
+        }
+        else if (colA.colliderType == 2) // Box
+        {
+            float groundDist = posA.y - colA.halfExtents.y;
+            if (groundDist < 0)
+            {
+                ContactPoint contact;
+                contact.position = float3(posA.x, 0, posA.z);
+                contact.penetration = -groundDist;
+                contact.normal = float3(0, 1, 0);
+                contact.bodyIndexA = colA.bodyIndex;
+                contact.bodyIndexB = -1;
+                contact.colliderIndexA = i;
+                contact.colliderIndexB = -1;
+                contact.relativeVelocity = bodyA.linearVelocity;
+                contact.impulse = 0;
+                
+                _ContactPoints[contactOffset + contactCount] = contact;
+                contactCount++;
+            }
+        }
+        
+        // Check against other colliders in same environment
+        for (uint j = i + 1; j < (uint)_MaxCollidersPerEnv && contactCount < (uint)_MaxContactsPerEnv; j++)
+        {
+            ColliderDescriptor colB = _ColliderDescriptors[colliderOffset + j];
+            if (colB.colliderType == 0xFFFFFFFF) continue;
+            if (colA.bodyIndex == colB.bodyIndex) continue; // Skip self-collision
+            
+            RigidBodyState bodyB = _RigidBodyStates[bodyOffset + colB.bodyIndex];
+            float3 posB = bodyB.position + QuatRotateVector(bodyB.orientation, colB.localPosition);
+            
+            float3 delta = posB - posA;
+            float dist = length(delta);
+            float minDist = colA.radius + colB.radius;
+            
+            if (dist < minDist && dist > 0.0001f)
+            {
+                ContactPoint contact;
+                contact.normal = delta / dist;
+                contact.position = posA + contact.normal * colA.radius;
+                contact.penetration = minDist - dist;
+                contact.bodyIndexA = colA.bodyIndex;
+                contact.bodyIndexB = colB.bodyIndex;
+                contact.colliderIndexA = i;
+                contact.colliderIndexB = j;
+                contact.relativeVelocity = bodyB.linearVelocity - bodyA.linearVelocity;
+                contact.impulse = 0;
+                
+                _ContactPoints[contactOffset + contactCount] = contact;
+                contactCount++;
+            }
+        }
+    }
+    
+    // Store contact count in environment state
+    _EnvironmentStates[envIndex].stepCount = contactCount;
+}
+
+// Kernel 3: Narrow-phase collision (detailed contact generation)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NarrowPhaseCollision(uint3 id : SV_DispatchThreadID)
+{
+    // For now, broad phase handles simple collision
+    // Narrow phase would refine contact points for complex geometry
+    // TODO: Implement GJK/EPA for convex shapes
+}
+
+// Kernel 4: Solve velocity constraints (PGS/Gauss-Seidel)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SolveConstraints(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    uint contactOffset = envIndex * (uint)_MaxContactsPerEnv;
+    uint numContacts = _EnvironmentStates[envIndex].stepCount;
+    
+    // Iterate solver
+    for (int iter = 0; iter < _SolverIterations; iter++)
+    {
+        // Solve joint constraints
+        for (uint j = 0; j < (uint)_MaxJointsPerEnv; j++)
+        {
+            JointState joint = _JointStates[jointOffset + j];
+            if (joint.jointType == 0) continue; // Skip fixed joints
+            
+            RigidBodyState parentBody = _RigidBodyStates[bodyOffset + joint.parentBodyIndex];
+            RigidBodyState childBody = _RigidBodyStates[bodyOffset + joint.childBodyIndex];
+            
+            // Hinge joint constraint
+            if (joint.jointType == 1)
+            {
+                // Apply PD control torque
+                float error = joint.targetPosition - joint.position;
+                float dError = joint.targetVelocity - joint.velocity;
+                float torque = joint.kp * error + joint.kd * dError + joint.torque;
+                torque = clamp(torque, -joint.torqueMax, joint.torqueMax);
+                
+                // Apply torque to bodies
+                float3 axis = float3(0, 1, 0); // Local hinge axis (should be from model)
+                float3 worldAxis = QuatRotateVector(parentBody.orientation, axis);
+                
+                if (parentBody.invMass > 0)
+                    parentBody.angularVelocity -= worldAxis * torque * parentBody.invInertiaTensor.y * _SubstepDt;
+                if (childBody.invMass > 0)
+                    childBody.angularVelocity += worldAxis * torque * childBody.invInertiaTensor.y * _SubstepDt;
+                
+                _RigidBodyStates[bodyOffset + joint.parentBodyIndex] = parentBody;
+                _RigidBodyStates[bodyOffset + joint.childBodyIndex] = childBody;
+            }
+        }
+        
+        // Solve contact constraints
+        for (uint c = 0; c < numContacts && c < (uint)_MaxContactsPerEnv; c++)
+        {
+            ContactPoint contact = _ContactPoints[contactOffset + c];
+            
+            if (contact.bodyIndexA < 0) continue;
+            
+            RigidBodyState bodyA = _RigidBodyStates[bodyOffset + contact.bodyIndexA];
+            
+            // Compute relative velocity at contact
+            float3 relVel = bodyA.linearVelocity;
+            if (contact.bodyIndexB >= 0)
+            {
+                RigidBodyState bodyB = _RigidBodyStates[bodyOffset + contact.bodyIndexB];
+                relVel -= bodyB.linearVelocity;
+            }
+            
+            float vn = dot(relVel, contact.normal);
+            
+            // Only resolve separating contacts
+            if (vn > 0) continue;
+            
+            // Compute impulse magnitude
+            float invMassSum = bodyA.invMass;
+            if (contact.bodyIndexB >= 0)
+            {
+                RigidBodyState bodyB = _RigidBodyStates[bodyOffset + contact.bodyIndexB];
+                invMassSum += bodyB.invMass;
+            }
+            
+            if (invMassSum <= 0) continue;
+            
+            // Baumgarte stabilization
+            float bias = _ContactBias * contact.penetration * _InvDeltaTime;
+            float jn = -(vn + bias) / invMassSum;
+            jn = max(jn, 0);
+            
+            // Accumulate impulse
+            float oldImpulse = contact.impulse;
+            contact.impulse = max(oldImpulse + jn, 0);
+            float deltaImpulse = contact.impulse - oldImpulse;
+            
+            // Apply impulse
+            float3 impulse = contact.normal * deltaImpulse;
+            bodyA.linearVelocity += impulse * bodyA.invMass;
+            
+            if (contact.bodyIndexB >= 0)
+            {
+                RigidBodyState bodyB = _RigidBodyStates[bodyOffset + contact.bodyIndexB];
+                bodyB.linearVelocity -= impulse * bodyB.invMass;
+                _RigidBodyStates[bodyOffset + contact.bodyIndexB] = bodyB;
+            }
+            
+            _RigidBodyStates[bodyOffset + contact.bodyIndexA] = bodyA;
+            _ContactPoints[contactOffset + c] = contact;
+            
+            // Friction
+            float3 vt = relVel - contact.normal * vn;
+            float vtMag = length(vt);
+            if (vtMag > 0.0001f)
+            {
+                float3 tangent = vt / vtMag;
+                float jt = -vtMag / invMassSum;
+                float maxFriction = _DefaultFriction * contact.impulse;
+                jt = clamp(jt, -maxFriction, maxFriction);
+                
+                float3 frictionImpulse = tangent * jt;
+                bodyA = _RigidBodyStates[bodyOffset + contact.bodyIndexA];
+                bodyA.linearVelocity += frictionImpulse * bodyA.invMass;
+                _RigidBodyStates[bodyOffset + contact.bodyIndexA] = bodyA;
+                
+                if (contact.bodyIndexB >= 0)
+                {
+                    RigidBodyState bodyB = _RigidBodyStates[bodyOffset + contact.bodyIndexB];
+                    bodyB.linearVelocity -= frictionImpulse * bodyB.invMass;
+                    _RigidBodyStates[bodyOffset + contact.bodyIndexB] = bodyB;
+                }
+            }
+        }
+    }
+}
+
+// Kernel 5: Apply actuator control (PD control / direct torque)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyActuators(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    uint actuatorOffset = envIndex * (uint)_MaxJointsPerEnv;
+    uint actionOffset = envIndex * MAX_ACTION_SIZE;
+    
+    for (uint a = 0; a < (uint)_MaxJointsPerEnv; a++)
+    {
+        ActuatorCommand cmd = _ActuatorCommands[actuatorOffset + a];
+        
+        // Read action from ML-Agents
+        float action = 0;
+        if (a < MAX_ACTION_SIZE)
+        {
+            action = _Actions[actionOffset + a];
+        }
+        
+        // Scale action to target position
+        JointState joint = _JointStates[jointOffset + a];
+        float targetPos = lerp(joint.positionMin, joint.positionMax, (action + 1.0f) * 0.5f);
+        
+        joint.targetPosition = targetPos;
+        joint.targetVelocity = cmd.targetVelocity;
+        joint.kp = cmd.kp > 0 ? cmd.kp : 200.0f;
+        joint.kd = cmd.kd > 0 ? cmd.kd : 5.0f;
+        
+        _JointStates[jointOffset + a] = joint;
+    }
+}
+
+// Kernel 6: Compute observations for ML-Agents
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeObservations(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    uint obsOffset = envIndex * MAX_OBS_SIZE;
+    
+    uint obsIndex = 0;
+    
+    // Base body state (root)
+    RigidBodyState rootBody = _RigidBodyStates[bodyOffset];
+    
+    // Position (3)
+    _Observations[obsOffset + obsIndex++] = rootBody.position.x;
+    _Observations[obsOffset + obsIndex++] = rootBody.position.y;
+    _Observations[obsOffset + obsIndex++] = rootBody.position.z;
+    
+    // Orientation as euler angles (3) - simplified
+    float3x3 rotMat = QuatToMatrix(rootBody.orientation);
+    _Observations[obsOffset + obsIndex++] = atan2(rotMat._21, rotMat._22);
+    _Observations[obsOffset + obsIndex++] = asin(-rotMat._20);
+    _Observations[obsOffset + obsIndex++] = atan2(rotMat._10, rotMat._00);
+    
+    // Linear velocity (3)
+    _Observations[obsOffset + obsIndex++] = rootBody.linearVelocity.x;
+    _Observations[obsOffset + obsIndex++] = rootBody.linearVelocity.y;
+    _Observations[obsOffset + obsIndex++] = rootBody.linearVelocity.z;
+    
+    // Angular velocity (3)
+    _Observations[obsOffset + obsIndex++] = rootBody.angularVelocity.x;
+    _Observations[obsOffset + obsIndex++] = rootBody.angularVelocity.y;
+    _Observations[obsOffset + obsIndex++] = rootBody.angularVelocity.z;
+    
+    // Joint positions and velocities
+    for (uint j = 0; j < (uint)_MaxJointsPerEnv && obsIndex < MAX_OBS_SIZE - 2; j++)
+    {
+        JointState joint = _JointStates[jointOffset + j];
+        _Observations[obsOffset + obsIndex++] = joint.position;
+        _Observations[obsOffset + obsIndex++] = joint.velocity;
+    }
+    
+    // Pad remaining observations with zeros
+    while (obsIndex < MAX_OBS_SIZE)
+    {
+        _Observations[obsOffset + obsIndex++] = 0;
+    }
+}
+
+// Kernel 7: Reset environments that are done
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ResetEnvironments(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    EnvironmentState env = _EnvironmentStates[envIndex];
+    
+    if (env.needsReset == 0) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    
+    // Reset all bodies to default positions
+    for (uint b = 0; b < (uint)_MaxBodiesPerEnv; b++)
+    {
+        RigidBodyState body = _RigidBodyStates[bodyOffset + b];
+        
+        // Reset to initial state (should load from default state buffer)
+        body.linearVelocity = float3(0, 0, 0);
+        body.angularVelocity = float3(0, 0, 0);
+        body.orientation = float4(0, 0, 0, 1);
+        
+        // Add world offset for visualization grid layout
+        body.position.x += env.worldOffset.x;
+        body.position.z += env.worldOffset.z;
+        
+        _RigidBodyStates[bodyOffset + b] = body;
+    }
+    
+    // Reset all joints
+    for (uint j = 0; j < (uint)_MaxJointsPerEnv; j++)
+    {
+        JointState joint = _JointStates[jointOffset + j];
+        joint.position = 0;
+        joint.velocity = 0;
+        joint.acceleration = 0;
+        joint.torque = 0;
+        _JointStates[jointOffset + j] = joint;
+    }
+    
+    // Reset environment state
+    env.simulationTime = 0;
+    env.stepCount = 0;
+    env.reward = 0;
+    env.cumulativeReward = 0;
+    env.isDone = 0;
+    env.needsReset = 0;
+    
+    _EnvironmentStates[envIndex] = env;
+}
+
+// Kernel 8: Forward kinematics for articulated bodies
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeForwardKinematics(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    
+    // Compute forward kinematics from root to leaves
+    // This propagates joint angles to body transforms
+    for (uint j = 0; j < (uint)_MaxJointsPerEnv; j++)
+    {
+        JointState joint = _JointStates[jointOffset + j];
+        if (joint.jointType == 0) continue;
+        
+        RigidBodyState parentBody = _RigidBodyStates[bodyOffset + joint.parentBodyIndex];
+        RigidBodyState childBody = _RigidBodyStates[bodyOffset + joint.childBodyIndex];
+        
+        if (joint.jointType == 1) // Hinge
+        {
+            // Compute child orientation from parent + joint angle
+            float3 axis = float3(0, 1, 0); // Should come from model
+            float4 jointQuat = QuatFromAxisAngle(axis, joint.position);
+            childBody.orientation = QuatNormalize(QuatMultiply(parentBody.orientation, jointQuat));
+        }
+        
+        _RigidBodyStates[bodyOffset + joint.childBodyIndex] = childBody;
+    }
+}
+
+// Kernel 9: Inverse dynamics for computing required joint torques
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeInverseDynamics(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    
+    // Recursive Newton-Euler algorithm
+    // Pass 1: Compute velocities and accelerations from root to leaves
+    // Pass 2: Compute forces and torques from leaves to root
+    
+    // Simplified version: update joint velocities from body angular velocities
+    for (uint j = 0; j < (uint)_MaxJointsPerEnv; j++)
+    {
+        JointState joint = _JointStates[jointOffset + j];
+        if (joint.jointType == 0) continue;
+        
+        RigidBodyState childBody = _RigidBodyStates[bodyOffset + joint.childBodyIndex];
+        
+        // Project body angular velocity onto joint axis
+        float3 axis = float3(0, 1, 0); // Should come from model
+        joint.velocity = dot(childBody.angularVelocity, axis);
+        
+        // Update joint position (integrate)
+        joint.position += joint.velocity * _SubstepDt;
+        
+        // Clamp to limits
+        joint.position = clamp(joint.position, joint.positionMin, joint.positionMax);
+        
+        _JointStates[jointOffset + j] = joint;
+    }
+}

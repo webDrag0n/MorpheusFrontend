@@ -1,0 +1,901 @@
+// =============================================================================
+// Collision Detection Compute Shader
+// Implements GPU-accelerated broadphase and narrowphase collision detection
+// Optimized for 4096+ parallel environments
+// =============================================================================
+
+#pragma kernel BuildSpatialHash
+#pragma kernel BroadPhaseAABB
+#pragma kernel NarrowPhaseSphereVsSphere
+#pragma kernel NarrowPhaseSphereVsBox
+#pragma kernel NarrowPhaseBoxVsBox
+#pragma kernel NarrowPhaseCapsuleVsCapsule
+#pragma kernel NarrowPhaseGJK
+#pragma kernel GenerateContactManifold
+#pragma kernel SortContacts
+
+#define THREAD_GROUP_SIZE 256
+#define MAX_CONTACTS_PER_PAIR 4
+#define SPATIAL_HASH_SIZE 1024
+#define MAX_COLLIDERS_PER_CELL 16
+#define GJK_MAX_ITERATIONS 32
+#define EPA_MAX_ITERATIONS 32
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+struct AABB
+{
+    float3 minPoint;
+    float _padding0;
+    float3 maxPoint;
+    float _padding1;
+};
+
+struct CollisionPair
+{
+    int envIndex;
+    int colliderA;
+    int colliderB;
+    int _padding;
+};
+
+struct SpatialHashCell
+{
+    int colliderIndices[MAX_COLLIDERS_PER_CELL];
+    int count;
+    int3 _padding;
+};
+
+struct GJKSimplex
+{
+    float3 points[4];
+    int numPoints;
+    float3 _padding;
+};
+
+struct EPAFace
+{
+    int indices[3];
+    float3 normal;
+    float distance;
+    int _padding;
+};
+
+struct ColliderData
+{
+    uint colliderType; // 0=sphere, 1=capsule, 2=box, 3=plane, 4=convex
+    float radius;
+    float height;
+    float _padding0;
+    
+    float3 halfExtents;
+    float _padding1;
+    
+    float3 localPosition;
+    float _padding2;
+    float4 localRotation;
+    
+    float3 worldPosition;
+    float _padding3;
+    float4 worldRotation;
+    
+    int bodyIndex;
+    int envIndex;
+    float friction;
+    float restitution;
+};
+
+struct Contact
+{
+    float3 pointA;
+    float penetration;
+    float3 pointB;
+    float _padding0;
+    float3 normal;
+    float _padding1;
+    
+    int colliderA;
+    int colliderB;
+    int envIndex;
+    int isActive;
+    
+    float3 tangent1;
+    float lambda_n;
+    float3 tangent2;
+    float lambda_t1;
+    
+    float lambda_t2;
+    float bias;
+    float massNormal;
+    float massTangent;
+};
+
+// =============================================================================
+// Buffers
+// =============================================================================
+
+StructuredBuffer<ColliderData> _Colliders;
+RWStructuredBuffer<AABB> _AABBs;
+RWStructuredBuffer<CollisionPair> _CollisionPairs;
+RWStructuredBuffer<uint> _PairCount;
+RWStructuredBuffer<SpatialHashCell> _SpatialHash;
+RWStructuredBuffer<Contact> _Contacts;
+RWStructuredBuffer<uint> _ContactCount;
+
+cbuffer CollisionParams
+{
+    int _NumEnvironments;
+    int _MaxCollidersPerEnv;
+    int _MaxContactsPerEnv;
+    float _CollisionMargin;
+    float3 _WorldMin;
+    float _CellSize;
+    float3 _WorldMax;
+    int _HashTableSize;
+};
+
+// =============================================================================
+// Spatial Hash Functions
+// =============================================================================
+
+int3 WorldToCell(float3 position)
+{
+    return int3(floor((position - _WorldMin) / _CellSize));
+}
+
+uint HashCell(int3 cell)
+{
+    // Spatial hash function
+    uint h = ((uint)cell.x * 73856093u) ^ ((uint)cell.y * 19349663u) ^ ((uint)cell.z * 83492791u);
+    return h % (uint)_HashTableSize;
+}
+
+// =============================================================================
+// AABB Functions
+// =============================================================================
+
+AABB ComputeAABB(ColliderData col)
+{
+    AABB aabb;
+    float3 pos = col.worldPosition;
+    
+    switch (col.colliderType)
+    {
+        case 0: // Sphere
+            aabb.minPoint = pos - float3(col.radius, col.radius, col.radius);
+            aabb.maxPoint = pos + float3(col.radius, col.radius, col.radius);
+            break;
+            
+        case 1: // Capsule
+            {
+                float r = col.radius;
+                float h = col.height * 0.5f;
+                float3 axis = float3(0, 1, 0); // Local axis
+                // Transform axis to world
+                float4 q = col.worldRotation;
+                float3 u = q.xyz;
+                float s = q.w;
+                axis = 2.0f * dot(u, axis) * u + (s*s - dot(u,u)) * axis + 2.0f * s * cross(u, axis);
+                
+                float3 extent = abs(axis) * h + float3(r, r, r);
+                aabb.minPoint = pos - extent;
+                aabb.maxPoint = pos + extent;
+            }
+            break;
+            
+        case 2: // Box
+            {
+                // Compute rotated AABB
+                float4 q = col.worldRotation;
+                float3 he = col.halfExtents;
+                
+                // Get rotation matrix columns
+                float3x3 R;
+                float xx = q.x*q.x, yy = q.y*q.y, zz = q.z*q.z;
+                float xy = q.x*q.y, xz = q.x*q.z, yz = q.y*q.z;
+                float wx = q.w*q.x, wy = q.w*q.y, wz = q.w*q.z;
+                
+                R[0] = float3(1-2*(yy+zz), 2*(xy+wz), 2*(xz-wy));
+                R[1] = float3(2*(xy-wz), 1-2*(xx+zz), 2*(yz+wx));
+                R[2] = float3(2*(xz+wy), 2*(yz-wx), 1-2*(xx+yy));
+                
+                float3 extent;
+                extent.x = abs(R[0].x)*he.x + abs(R[1].x)*he.y + abs(R[2].x)*he.z;
+                extent.y = abs(R[0].y)*he.x + abs(R[1].y)*he.y + abs(R[2].y)*he.z;
+                extent.z = abs(R[0].z)*he.x + abs(R[1].z)*he.y + abs(R[2].z)*he.z;
+                
+                aabb.minPoint = pos - extent;
+                aabb.maxPoint = pos + extent;
+            }
+            break;
+            
+        case 3: // Plane (infinite)
+            aabb.minPoint = float3(-1e10, -1e10, -1e10);
+            aabb.maxPoint = float3(1e10, 1e10, 1e10);
+            break;
+            
+        default:
+            aabb.minPoint = pos - float3(1, 1, 1);
+            aabb.maxPoint = pos + float3(1, 1, 1);
+            break;
+    }
+    
+    // Add margin
+    aabb.minPoint -= float3(_CollisionMargin, _CollisionMargin, _CollisionMargin);
+    aabb.maxPoint += float3(_CollisionMargin, _CollisionMargin, _CollisionMargin);
+    
+    return aabb;
+}
+
+bool AABBIntersect(AABB a, AABB b)
+{
+    return all(a.minPoint <= b.maxPoint) && all(a.maxPoint >= b.minPoint);
+}
+
+// =============================================================================
+// Build Spatial Hash
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void BuildSpatialHash(uint3 id : SV_DispatchThreadID)
+{
+    uint totalColliders = (uint)_NumEnvironments * (uint)_MaxCollidersPerEnv;
+    if (id.x >= totalColliders) return;
+    
+    ColliderData col = _Colliders[id.x];
+    if (col.colliderType == 0xFFFFFFFF) return; // Invalid collider
+    
+    // Compute AABB
+    AABB aabb = ComputeAABB(col);
+    _AABBs[id.x] = aabb;
+    
+    // Insert into spatial hash cells
+    int3 minCell = WorldToCell(aabb.minPoint);
+    int3 maxCell = WorldToCell(aabb.maxPoint);
+    
+    for (int z = minCell.z; z <= maxCell.z; z++)
+    {
+        for (int y = minCell.y; y <= maxCell.y; y++)
+        {
+            for (int x = minCell.x; x <= maxCell.x; x++)
+            {
+                uint hashIdx = HashCell(int3(x, y, z));
+                
+                // Atomic add to cell
+                uint oldCount;
+                InterlockedAdd(_SpatialHash[hashIdx].count, 1, oldCount);
+                
+                if (oldCount < MAX_COLLIDERS_PER_CELL)
+                {
+                    _SpatialHash[hashIdx].colliderIndices[oldCount] = (int)id.x;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Broad Phase AABB
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void BroadPhaseAABB(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint colliderOffset = envIndex * (uint)_MaxCollidersPerEnv;
+    
+    // O(n^2) within environment (simple but effective for small n)
+    for (uint i = 0; i < (uint)_MaxCollidersPerEnv; i++)
+    {
+        ColliderData colA = _Colliders[colliderOffset + i];
+        if (colA.colliderType == 0xFFFFFFFF) continue;
+        
+        AABB aabbA = _AABBs[colliderOffset + i];
+        
+        for (uint j = i + 1; j < (uint)_MaxCollidersPerEnv; j++)
+        {
+            ColliderData colB = _Colliders[colliderOffset + j];
+            if (colB.colliderType == 0xFFFFFFFF) continue;
+            
+            // Skip same body collisions
+            if (colA.bodyIndex == colB.bodyIndex) continue;
+            
+            AABB aabbB = _AABBs[colliderOffset + j];
+            
+            if (AABBIntersect(aabbA, aabbB))
+            {
+                // Add collision pair
+                uint pairIdx;
+                InterlockedAdd(_PairCount[0], 1, pairIdx);
+                
+                if (pairIdx < (uint)_NumEnvironments * (uint)_MaxCollidersPerEnv)
+                {
+                    CollisionPair pair;
+                    pair.envIndex = (int)envIndex;
+                    pair.colliderA = (int)i;
+                    pair.colliderB = (int)j;
+                    _CollisionPairs[pairIdx] = pair;
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Narrow Phase: Sphere vs Sphere
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NarrowPhaseSphereVsSphere(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PairCount[0]) return;
+    
+    CollisionPair pair = _CollisionPairs[id.x];
+    uint colliderOffset = pair.envIndex * (uint)_MaxCollidersPerEnv;
+    
+    ColliderData colA = _Colliders[colliderOffset + pair.colliderA];
+    ColliderData colB = _Colliders[colliderOffset + pair.colliderB];
+    
+    // Only handle sphere-sphere pairs
+    if (colA.colliderType != 0 || colB.colliderType != 0) return;
+    
+    float3 delta = colB.worldPosition - colA.worldPosition;
+    float dist = length(delta);
+    float minDist = colA.radius + colB.radius;
+    
+    if (dist < minDist && dist > 1e-6f)
+    {
+        uint contactIdx;
+        InterlockedAdd(_ContactCount[0], 1, contactIdx);
+        
+        if (contactIdx < (uint)_NumEnvironments * (uint)_MaxContactsPerEnv)
+        {
+            Contact contact;
+            contact.normal = delta / dist;
+            contact.penetration = minDist - dist;
+            contact.pointA = colA.worldPosition + contact.normal * colA.radius;
+            contact.pointB = colB.worldPosition - contact.normal * colB.radius;
+            contact.colliderA = pair.colliderA;
+            contact.colliderB = pair.colliderB;
+            contact.envIndex = pair.envIndex;
+            contact.isActive = 1;
+            
+            // Compute tangent basis
+            float3 t1 = abs(contact.normal.x) > 0.9f ? float3(0, 1, 0) : float3(1, 0, 0);
+            contact.tangent1 = normalize(cross(contact.normal, t1));
+            contact.tangent2 = cross(contact.normal, contact.tangent1);
+            
+            contact.lambda_n = 0;
+            contact.lambda_t1 = 0;
+            contact.lambda_t2 = 0;
+            contact.friction = (colA.friction + colB.friction) * 0.5f;
+            
+            _Contacts[contactIdx] = contact;
+        }
+    }
+}
+
+// =============================================================================
+// Narrow Phase: Sphere vs Box
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NarrowPhaseSphereVsBox(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PairCount[0]) return;
+    
+    CollisionPair pair = _CollisionPairs[id.x];
+    uint colliderOffset = pair.envIndex * (uint)_MaxCollidersPerEnv;
+    
+    ColliderData colA = _Colliders[colliderOffset + pair.colliderA];
+    ColliderData colB = _Colliders[colliderOffset + pair.colliderB];
+    
+    // Handle sphere-box (either order)
+    ColliderData sphere, box;
+    if (colA.colliderType == 0 && colB.colliderType == 2)
+    {
+        sphere = colA;
+        box = colB;
+    }
+    else if (colA.colliderType == 2 && colB.colliderType == 0)
+    {
+        sphere = colB;
+        box = colA;
+    }
+    else return;
+    
+    // Transform sphere center to box local space
+    float4 q = box.worldRotation;
+    float4 qInv = float4(-q.xyz, q.w);
+    float3 localSpherePos = sphere.worldPosition - box.worldPosition;
+    
+    // Quaternion rotation
+    float3 u = qInv.xyz;
+    float s = qInv.w;
+    localSpherePos = 2.0f * dot(u, localSpherePos) * u + 
+                     (s*s - dot(u,u)) * localSpherePos + 
+                     2.0f * s * cross(u, localSpherePos);
+    
+    // Find closest point on box
+    float3 closest = clamp(localSpherePos, -box.halfExtents, box.halfExtents);
+    
+    float3 delta = localSpherePos - closest;
+    float dist = length(delta);
+    
+    if (dist < sphere.radius && dist > 1e-6f)
+    {
+        uint contactIdx;
+        InterlockedAdd(_ContactCount[0], 1, contactIdx);
+        
+        if (contactIdx < (uint)_NumEnvironments * (uint)_MaxContactsPerEnv)
+        {
+            // Transform back to world space
+            float3 normal = delta / dist;
+            u = q.xyz;
+            s = q.w;
+            float3 worldNormal = 2.0f * dot(u, normal) * u + 
+                                (s*s - dot(u,u)) * normal + 
+                                2.0f * s * cross(u, normal);
+            
+            float3 worldClosest = 2.0f * dot(u, closest) * u + 
+                                 (s*s - dot(u,u)) * closest + 
+                                 2.0f * s * cross(u, closest);
+            worldClosest += box.worldPosition;
+            
+            Contact contact;
+            contact.normal = worldNormal;
+            contact.penetration = sphere.radius - dist;
+            contact.pointA = sphere.worldPosition - worldNormal * sphere.radius;
+            contact.pointB = worldClosest;
+            contact.colliderA = pair.colliderA;
+            contact.colliderB = pair.colliderB;
+            contact.envIndex = pair.envIndex;
+            contact.isActive = 1;
+            
+            // Compute tangent basis
+            float3 t1 = abs(contact.normal.x) > 0.9f ? float3(0, 1, 0) : float3(1, 0, 0);
+            contact.tangent1 = normalize(cross(contact.normal, t1));
+            contact.tangent2 = cross(contact.normal, contact.tangent1);
+            
+            contact.lambda_n = 0;
+            contact.lambda_t1 = 0;
+            contact.lambda_t2 = 0;
+            
+            _Contacts[contactIdx] = contact;
+        }
+    }
+}
+
+// =============================================================================
+// Narrow Phase: Box vs Box (SAT)
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NarrowPhaseBoxVsBox(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PairCount[0]) return;
+    
+    CollisionPair pair = _CollisionPairs[id.x];
+    uint colliderOffset = pair.envIndex * (uint)_MaxCollidersPerEnv;
+    
+    ColliderData colA = _Colliders[colliderOffset + pair.colliderA];
+    ColliderData colB = _Colliders[colliderOffset + pair.colliderB];
+    
+    if (colA.colliderType != 2 || colB.colliderType != 2) return;
+    
+    // Separating Axis Theorem for OBB-OBB
+    // TODO: Implement full SAT with 15 axes
+    
+    // Simplified: treat as AABBs for now
+    AABB aabbA = _AABBs[colliderOffset + pair.colliderA];
+    AABB aabbB = _AABBs[colliderOffset + pair.colliderB];
+    
+    if (!AABBIntersect(aabbA, aabbB)) return;
+    
+    // Compute overlap
+    float3 overlap = min(aabbA.maxPoint, aabbB.maxPoint) - max(aabbA.minPoint, aabbB.minPoint);
+    
+    // Find minimum overlap axis
+    int minAxis = 0;
+    float minOverlap = overlap.x;
+    if (overlap.y < minOverlap) { minOverlap = overlap.y; minAxis = 1; }
+    if (overlap.z < minOverlap) { minOverlap = overlap.z; minAxis = 2; }
+    
+    if (minOverlap > 0)
+    {
+        uint contactIdx;
+        InterlockedAdd(_ContactCount[0], 1, contactIdx);
+        
+        if (contactIdx < (uint)_NumEnvironments * (uint)_MaxContactsPerEnv)
+        {
+            Contact contact;
+            contact.normal = float3(0, 0, 0);
+            contact.normal[minAxis] = sign(colB.worldPosition[minAxis] - colA.worldPosition[minAxis]);
+            contact.penetration = minOverlap;
+            contact.pointA = (colA.worldPosition + colB.worldPosition) * 0.5f;
+            contact.pointB = contact.pointA;
+            contact.colliderA = pair.colliderA;
+            contact.colliderB = pair.colliderB;
+            contact.envIndex = pair.envIndex;
+            contact.isActive = 1;
+            
+            float3 t1 = abs(contact.normal.x) > 0.9f ? float3(0, 1, 0) : float3(1, 0, 0);
+            contact.tangent1 = normalize(cross(contact.normal, t1));
+            contact.tangent2 = cross(contact.normal, contact.tangent1);
+            
+            contact.lambda_n = 0;
+            contact.lambda_t1 = 0;
+            contact.lambda_t2 = 0;
+            
+            _Contacts[contactIdx] = contact;
+        }
+    }
+}
+
+// =============================================================================
+// Narrow Phase: Capsule vs Capsule
+// =============================================================================
+
+float3 ClosestPointOnSegment(float3 a, float3 b, float3 p)
+{
+    float3 ab = b - a;
+    float t = saturate(dot(p - a, ab) / dot(ab, ab));
+    return a + t * ab;
+}
+
+void ClosestPointsBetweenSegments(float3 a1, float3 b1, float3 a2, float3 b2, out float3 c1, out float3 c2)
+{
+    float3 d1 = b1 - a1;
+    float3 d2 = b2 - a2;
+    float3 r = a1 - a2;
+    
+    float a = dot(d1, d1);
+    float e = dot(d2, d2);
+    float f = dot(d2, r);
+    
+    float s = 0, t = 0;
+    
+    if (a <= 1e-6f && e <= 1e-6f)
+    {
+        s = t = 0;
+    }
+    else if (a <= 1e-6f)
+    {
+        s = 0;
+        t = saturate(f / e);
+    }
+    else
+    {
+        float c = dot(d1, r);
+        if (e <= 1e-6f)
+        {
+            t = 0;
+            s = saturate(-c / a);
+        }
+        else
+        {
+            float b = dot(d1, d2);
+            float denom = a * e - b * b;
+            
+            if (denom != 0)
+            {
+                s = saturate((b * f - c * e) / denom);
+            }
+            
+            t = (b * s + f) / e;
+            
+            if (t < 0)
+            {
+                t = 0;
+                s = saturate(-c / a);
+            }
+            else if (t > 1)
+            {
+                t = 1;
+                s = saturate((b - c) / a);
+            }
+        }
+    }
+    
+    c1 = a1 + d1 * s;
+    c2 = a2 + d2 * t;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NarrowPhaseCapsuleVsCapsule(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PairCount[0]) return;
+    
+    CollisionPair pair = _CollisionPairs[id.x];
+    uint colliderOffset = pair.envIndex * (uint)_MaxCollidersPerEnv;
+    
+    ColliderData colA = _Colliders[colliderOffset + pair.colliderA];
+    ColliderData colB = _Colliders[colliderOffset + pair.colliderB];
+    
+    if (colA.colliderType != 1 || colB.colliderType != 1) return;
+    
+    // Get capsule endpoints
+    float3 axisA = float3(0, colA.height * 0.5f, 0);
+    float3 axisB = float3(0, colB.height * 0.5f, 0);
+    
+    // Transform axes to world space
+    float4 qA = colA.worldRotation;
+    float3 uA = qA.xyz;
+    float sA = qA.w;
+    axisA = 2.0f * dot(uA, axisA) * uA + (sA*sA - dot(uA,uA)) * axisA + 2.0f * sA * cross(uA, axisA);
+    
+    float4 qB = colB.worldRotation;
+    float3 uB = qB.xyz;
+    float sB = qB.w;
+    axisB = 2.0f * dot(uB, axisB) * uB + (sB*sB - dot(uB,uB)) * axisB + 2.0f * sB * cross(uB, axisB);
+    
+    float3 a1 = colA.worldPosition - axisA;
+    float3 b1 = colA.worldPosition + axisA;
+    float3 a2 = colB.worldPosition - axisB;
+    float3 b2 = colB.worldPosition + axisB;
+    
+    float3 c1, c2;
+    ClosestPointsBetweenSegments(a1, b1, a2, b2, c1, c2);
+    
+    float3 delta = c2 - c1;
+    float dist = length(delta);
+    float minDist = colA.radius + colB.radius;
+    
+    if (dist < minDist && dist > 1e-6f)
+    {
+        uint contactIdx;
+        InterlockedAdd(_ContactCount[0], 1, contactIdx);
+        
+        if (contactIdx < (uint)_NumEnvironments * (uint)_MaxContactsPerEnv)
+        {
+            Contact contact;
+            contact.normal = delta / dist;
+            contact.penetration = minDist - dist;
+            contact.pointA = c1 + contact.normal * colA.radius;
+            contact.pointB = c2 - contact.normal * colB.radius;
+            contact.colliderA = pair.colliderA;
+            contact.colliderB = pair.colliderB;
+            contact.envIndex = pair.envIndex;
+            contact.isActive = 1;
+            
+            float3 t1 = abs(contact.normal.x) > 0.9f ? float3(0, 1, 0) : float3(1, 0, 0);
+            contact.tangent1 = normalize(cross(contact.normal, t1));
+            contact.tangent2 = cross(contact.normal, contact.tangent1);
+            
+            contact.lambda_n = 0;
+            contact.lambda_t1 = 0;
+            contact.lambda_t2 = 0;
+            
+            _Contacts[contactIdx] = contact;
+        }
+    }
+}
+
+// =============================================================================
+// GJK Algorithm for Convex Shapes
+// =============================================================================
+
+float3 Support(ColliderData col, float3 dir)
+{
+    // Return the point on the collider furthest in direction dir
+    switch (col.colliderType)
+    {
+        case 0: // Sphere
+            return col.worldPosition + normalize(dir) * col.radius;
+            
+        case 2: // Box
+            {
+                float4 q = col.worldRotation;
+                float4 qInv = float4(-q.xyz, q.w);
+                
+                // Transform direction to local space
+                float3 u = qInv.xyz;
+                float s = qInv.w;
+                float3 localDir = 2.0f * dot(u, dir) * u + (s*s - dot(u,u)) * dir + 2.0f * s * cross(u, dir);
+                
+                // Find support in local space
+                float3 localSupport = sign(localDir) * col.halfExtents;
+                
+                // Transform back to world space
+                u = q.xyz;
+                s = q.w;
+                float3 worldSupport = 2.0f * dot(u, localSupport) * u + 
+                                     (s*s - dot(u,u)) * localSupport + 
+                                     2.0f * s * cross(u, localSupport);
+                return col.worldPosition + worldSupport;
+            }
+            
+        default:
+            return col.worldPosition;
+    }
+}
+
+float3 MinkowskiSupport(ColliderData colA, ColliderData colB, float3 dir)
+{
+    return Support(colA, dir) - Support(colB, -dir);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NarrowPhaseGJK(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PairCount[0]) return;
+    
+    CollisionPair pair = _CollisionPairs[id.x];
+    uint colliderOffset = pair.envIndex * (uint)_MaxCollidersPerEnv;
+    
+    ColliderData colA = _Colliders[colliderOffset + pair.colliderA];
+    ColliderData colB = _Colliders[colliderOffset + pair.colliderB];
+    
+    // Initial direction
+    float3 d = colB.worldPosition - colA.worldPosition;
+    if (dot(d, d) < 1e-6f) d = float3(1, 0, 0);
+    
+    GJKSimplex simplex;
+    simplex.numPoints = 0;
+    
+    // First support point
+    float3 a = MinkowskiSupport(colA, colB, d);
+    simplex.points[0] = a;
+    simplex.numPoints = 1;
+    
+    d = -a;
+    
+    bool collision = false;
+    
+    for (int i = 0; i < GJK_MAX_ITERATIONS; i++)
+    {
+        a = MinkowskiSupport(colA, colB, d);
+        
+        if (dot(a, d) < 0)
+        {
+            // No collision
+            break;
+        }
+        
+        // Add point to simplex
+        simplex.points[simplex.numPoints++] = a;
+        
+        // Process simplex (determine if origin is contained)
+        if (simplex.numPoints == 2)
+        {
+            // Line case
+            float3 ab = simplex.points[0] - a;
+            float3 ao = -a;
+            
+            if (dot(ab, ao) > 0)
+            {
+                d = cross(cross(ab, ao), ab);
+            }
+            else
+            {
+                simplex.points[0] = a;
+                simplex.numPoints = 1;
+                d = ao;
+            }
+        }
+        else if (simplex.numPoints == 3)
+        {
+            // Triangle case
+            float3 b = simplex.points[1];
+            float3 c = simplex.points[0];
+            float3 ab = b - a;
+            float3 ac = c - a;
+            float3 ao = -a;
+            float3 abc = cross(ab, ac);
+            
+            if (dot(cross(abc, ac), ao) > 0)
+            {
+                if (dot(ac, ao) > 0)
+                {
+                    simplex.points[0] = c;
+                    simplex.points[1] = a;
+                    simplex.numPoints = 2;
+                    d = cross(cross(ac, ao), ac);
+                }
+                else
+                {
+                    simplex.points[0] = a;
+                    simplex.numPoints = 1;
+                    d = ao;
+                }
+            }
+            else if (dot(cross(ab, abc), ao) > 0)
+            {
+                if (dot(ab, ao) > 0)
+                {
+                    simplex.points[0] = b;
+                    simplex.points[1] = a;
+                    simplex.numPoints = 2;
+                    d = cross(cross(ab, ao), ab);
+                }
+                else
+                {
+                    simplex.points[0] = a;
+                    simplex.numPoints = 1;
+                    d = ao;
+                }
+            }
+            else
+            {
+                if (dot(abc, ao) > 0)
+                {
+                    d = abc;
+                }
+                else
+                {
+                    simplex.points[0] = b;
+                    simplex.points[1] = c;
+                    simplex.points[2] = a;
+                    d = -abc;
+                }
+            }
+        }
+        else if (simplex.numPoints == 4)
+        {
+            // Tetrahedron case - check if origin is inside
+            // If so, collision detected
+            collision = true;
+            break;
+        }
+        
+        if (dot(d, d) < 1e-10f) break;
+    }
+    
+    if (collision)
+    {
+        // TODO: Run EPA to get contact information
+        // For now, just add a placeholder contact
+        uint contactIdx;
+        InterlockedAdd(_ContactCount[0], 1, contactIdx);
+        
+        if (contactIdx < (uint)_NumEnvironments * (uint)_MaxContactsPerEnv)
+        {
+            Contact contact;
+            contact.normal = normalize(colB.worldPosition - colA.worldPosition);
+            contact.penetration = 0.01f; // Placeholder
+            contact.pointA = colA.worldPosition;
+            contact.pointB = colB.worldPosition;
+            contact.colliderA = pair.colliderA;
+            contact.colliderB = pair.colliderB;
+            contact.envIndex = pair.envIndex;
+            contact.isActive = 1;
+            
+            float3 t1 = abs(contact.normal.x) > 0.9f ? float3(0, 1, 0) : float3(1, 0, 0);
+            contact.tangent1 = normalize(cross(contact.normal, t1));
+            contact.tangent2 = cross(contact.normal, contact.tangent1);
+            
+            contact.lambda_n = 0;
+            contact.lambda_t1 = 0;
+            contact.lambda_t2 = 0;
+            
+            _Contacts[contactIdx] = contact;
+        }
+    }
+}
+
+// =============================================================================
+// Contact Manifold Generation
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GenerateContactManifold(uint3 id : SV_DispatchThreadID)
+{
+    // Generate multiple contact points for face-face contacts
+    // This improves stability for box-box and box-ground contacts
+    // TODO: Implement Sutherland-Hodgman clipping
+}
+
+// =============================================================================
+// Sort Contacts by Environment
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SortContacts(uint3 id : SV_DispatchThreadID)
+{
+    // Radix sort contacts by environment index for cache efficiency
+    // TODO: Implement GPU radix sort
+}

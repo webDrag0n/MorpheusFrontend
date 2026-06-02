@@ -1,0 +1,666 @@
+// =============================================================================
+// Constraint Solver Compute Shader
+// Implements PGS (Projected Gauss-Seidel) and XPBD for GPU-accelerated physics
+// =============================================================================
+
+#pragma kernel SolveContactsSequentialImpulses
+#pragma kernel SolveJointConstraints
+#pragma kernel SolvePositionConstraints
+#pragma kernel WarmStart
+#pragma kernel AccumulateImpulses
+#pragma kernel ApplyImpulses
+#pragma kernel ComputeConstraintForces
+
+#define THREAD_GROUP_SIZE 256
+#define MAX_CONTACTS_PER_ENV 64
+#define MAX_JOINTS_PER_ENV 19
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+struct RigidBody
+{
+    float3 position;
+    float invMass;
+    float4 orientation;
+    float3 linearVelocity;
+    float _padding0;
+    float3 angularVelocity;
+    float _padding1;
+    float3 invInertiaTensorWorld;
+    float _padding2;
+};
+
+struct Contact
+{
+    float3 pointA;
+    float penetration;
+    float3 pointB;
+    float restitution;
+    float3 normal;
+    float friction;
+    
+    int bodyA;
+    int bodyB;
+    int envIndex;
+    int isActive;
+    
+    float3 tangent1;
+    float lambda_n;
+    float3 tangent2;
+    float lambda_t1;
+    
+    float lambda_t2;
+    float bias;
+    float massNormal;
+    float massTangent1;
+    float massTangent2;
+    float3 _padding;
+};
+
+struct JointConstraint
+{
+    int bodyA;
+    int bodyB;
+    int envIndex;
+    uint jointType; // 0=fixed, 1=hinge, 2=slider, 3=ball
+    
+    float3 anchorA;
+    float _padding0;
+    float3 anchorB;
+    float _padding1;
+    float3 axisA;
+    float _padding2;
+    float3 axisB;
+    float _padding3;
+    
+    float positionMin;
+    float positionMax;
+    float currentPosition;
+    float targetPosition;
+    
+    float kp;
+    float kd;
+    float maxForce;
+    float compliance; // For XPBD
+    
+    float lambda; // Accumulated constraint force
+    float3 _padding4;
+};
+
+struct ConstraintRow
+{
+    float3 JA_linear;
+    float _padding0;
+    float3 JA_angular;
+    float _padding1;
+    float3 JB_linear;
+    float _padding2;
+    float3 JB_angular;
+    float _padding3;
+    
+    float rhs; // Right-hand side
+    float lambda; // Accumulated impulse
+    float lambdaMin;
+    float lambdaMax;
+    float effectiveMass;
+    float cfm; // Constraint force mixing
+    float erp; // Error reduction parameter
+    float _padding4;
+};
+
+// =============================================================================
+// Buffers
+// =============================================================================
+
+RWStructuredBuffer<RigidBody> _Bodies;
+RWStructuredBuffer<Contact> _Contacts;
+RWStructuredBuffer<JointConstraint> _JointConstraints;
+RWStructuredBuffer<ConstraintRow> _ConstraintRows;
+RWStructuredBuffer<float3> _DeltaLinearVelocity;
+RWStructuredBuffer<float3> _DeltaAngularVelocity;
+StructuredBuffer<uint> _ContactCount;
+StructuredBuffer<uint> _JointCount;
+
+cbuffer SolverParams
+{
+    float _DeltaTime;
+    float _InvDeltaTime;
+    int _NumEnvironments;
+    int _MaxBodiesPerEnv;
+    int _MaxContactsPerEnv;
+    int _MaxJointsPerEnv;
+    int _SolverIterations;
+    float _Baumgarte;
+    float _Slop;
+    float _Restitution;
+    float _Friction;
+    float _Compliance;
+    int _UsePGS; // 0 = XPBD, 1 = PGS
+};
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+float3 Cross(float3 a, float3 b)
+{
+    return float3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    );
+}
+
+float3x3 OuterProduct(float3 a, float3 b)
+{
+    return float3x3(
+        a.x * b.x, a.x * b.y, a.x * b.z,
+        a.y * b.x, a.y * b.y, a.y * b.z,
+        a.z * b.x, a.z * b.y, a.z * b.z
+    );
+}
+
+float ComputeEffectiveMass(
+    float3 normal,
+    float3 rA,
+    float3 rB,
+    float invMassA,
+    float invMassB,
+    float3 invInertiaA,
+    float3 invInertiaB)
+{
+    float3 rnA = Cross(rA, normal);
+    float3 rnB = Cross(rB, normal);
+    
+    float kNormal = invMassA + invMassB;
+    kNormal += dot(rnA * invInertiaA, rnA);
+    kNormal += dot(rnB * invInertiaB, rnB);
+    
+    return kNormal > 1e-6f ? 1.0f / kNormal : 0.0f;
+}
+
+// =============================================================================
+// Warm Start - Apply accumulated impulses from previous frame
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void WarmStart(uint3 id : SV_DispatchThreadID)
+{
+    uint contactIdx = id.x;
+    if (contactIdx >= _ContactCount[0]) return;
+    
+    Contact contact = _Contacts[contactIdx];
+    if (contact.isActive == 0) return;
+    
+    uint bodyOffset = contact.envIndex * (uint)_MaxBodiesPerEnv;
+    
+    RigidBody bodyA = _Bodies[bodyOffset + contact.bodyA];
+    RigidBody bodyB = _Bodies[bodyOffset + contact.bodyB];
+    
+    // Compute radius vectors
+    float3 rA = contact.pointA - bodyA.position;
+    float3 rB = contact.pointB - bodyB.position;
+    
+    // Apply warm start impulse
+    float3 impulse = contact.normal * contact.lambda_n +
+                     contact.tangent1 * contact.lambda_t1 +
+                     contact.tangent2 * contact.lambda_t2;
+    
+    // Apply to body A
+    if (bodyA.invMass > 0)
+    {
+        bodyA.linearVelocity -= impulse * bodyA.invMass;
+        bodyA.angularVelocity -= Cross(rA, impulse) * bodyA.invInertiaTensorWorld;
+    }
+    
+    // Apply to body B
+    if (bodyB.invMass > 0)
+    {
+        bodyB.linearVelocity += impulse * bodyB.invMass;
+        bodyB.angularVelocity += Cross(rB, impulse) * bodyB.invInertiaTensorWorld;
+    }
+    
+    _Bodies[bodyOffset + contact.bodyA] = bodyA;
+    _Bodies[bodyOffset + contact.bodyB] = bodyB;
+}
+
+// =============================================================================
+// Sequential Impulses (PGS) Contact Solver
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SolveContactsSequentialImpulses(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint contactOffset = envIndex * (uint)_MaxContactsPerEnv;
+    
+    // Iterate solver
+    for (int iter = 0; iter < _SolverIterations; iter++)
+    {
+        // Process each contact in this environment
+        for (uint c = 0; c < (uint)_MaxContactsPerEnv; c++)
+        {
+            Contact contact = _Contacts[contactOffset + c];
+            if (contact.isActive == 0) continue;
+            
+            RigidBody bodyA = _Bodies[bodyOffset + contact.bodyA];
+            RigidBody bodyB = _Bodies[bodyOffset + contact.bodyB];
+            
+            float3 rA = contact.pointA - bodyA.position;
+            float3 rB = contact.pointB - bodyB.position;
+            
+            // =================================================================
+            // Normal constraint
+            // =================================================================
+            
+            // Compute relative velocity at contact point
+            float3 velA = bodyA.linearVelocity + Cross(bodyA.angularVelocity, rA);
+            float3 velB = bodyB.linearVelocity + Cross(bodyB.angularVelocity, rB);
+            float3 relVel = velB - velA;
+            
+            float vn = dot(relVel, contact.normal);
+            
+            // Compute effective mass if not cached
+            if (contact.massNormal == 0)
+            {
+                contact.massNormal = ComputeEffectiveMass(
+                    contact.normal, rA, rB,
+                    bodyA.invMass, bodyB.invMass,
+                    bodyA.invInertiaTensorWorld, bodyB.invInertiaTensorWorld
+                );
+                
+                // Baumgarte bias
+                contact.bias = -_Baumgarte * _InvDeltaTime * max(0, contact.penetration - _Slop);
+                
+                // Restitution bias
+                if (vn < -1.0f)
+                {
+                    contact.bias -= contact.restitution * vn;
+                }
+            }
+            
+            // Compute impulse
+            float lambda = contact.massNormal * (-(vn + contact.bias));
+            
+            // Clamp accumulated impulse
+            float oldLambda = contact.lambda_n;
+            contact.lambda_n = max(0, oldLambda + lambda);
+            lambda = contact.lambda_n - oldLambda;
+            
+            // Apply impulse
+            float3 impulse = contact.normal * lambda;
+            
+            if (bodyA.invMass > 0)
+            {
+                bodyA.linearVelocity -= impulse * bodyA.invMass;
+                bodyA.angularVelocity -= Cross(rA, impulse) * bodyA.invInertiaTensorWorld;
+            }
+            if (bodyB.invMass > 0)
+            {
+                bodyB.linearVelocity += impulse * bodyB.invMass;
+                bodyB.angularVelocity += Cross(rB, impulse) * bodyB.invInertiaTensorWorld;
+            }
+            
+            // =================================================================
+            // Friction constraints
+            // =================================================================
+            
+            // Recompute relative velocity
+            velA = bodyA.linearVelocity + Cross(bodyA.angularVelocity, rA);
+            velB = bodyB.linearVelocity + Cross(bodyB.angularVelocity, rB);
+            relVel = velB - velA;
+            
+            float maxFriction = contact.friction * contact.lambda_n;
+            
+            // Tangent 1
+            {
+                float vt1 = dot(relVel, contact.tangent1);
+                
+                if (contact.massTangent1 == 0)
+                {
+                    contact.massTangent1 = ComputeEffectiveMass(
+                        contact.tangent1, rA, rB,
+                        bodyA.invMass, bodyB.invMass,
+                        bodyA.invInertiaTensorWorld, bodyB.invInertiaTensorWorld
+                    );
+                }
+                
+                float lambda1 = -contact.massTangent1 * vt1;
+                
+                float oldLambda1 = contact.lambda_t1;
+                contact.lambda_t1 = clamp(oldLambda1 + lambda1, -maxFriction, maxFriction);
+                lambda1 = contact.lambda_t1 - oldLambda1;
+                
+                float3 impulse1 = contact.tangent1 * lambda1;
+                
+                if (bodyA.invMass > 0)
+                {
+                    bodyA.linearVelocity -= impulse1 * bodyA.invMass;
+                    bodyA.angularVelocity -= Cross(rA, impulse1) * bodyA.invInertiaTensorWorld;
+                }
+                if (bodyB.invMass > 0)
+                {
+                    bodyB.linearVelocity += impulse1 * bodyB.invMass;
+                    bodyB.angularVelocity += Cross(rB, impulse1) * bodyB.invInertiaTensorWorld;
+                }
+            }
+            
+            // Tangent 2
+            {
+                // Recompute relative velocity after T1
+                velA = bodyA.linearVelocity + Cross(bodyA.angularVelocity, rA);
+                velB = bodyB.linearVelocity + Cross(bodyB.angularVelocity, rB);
+                relVel = velB - velA;
+                
+                float vt2 = dot(relVel, contact.tangent2);
+                
+                if (contact.massTangent2 == 0)
+                {
+                    contact.massTangent2 = ComputeEffectiveMass(
+                        contact.tangent2, rA, rB,
+                        bodyA.invMass, bodyB.invMass,
+                        bodyA.invInertiaTensorWorld, bodyB.invInertiaTensorWorld
+                    );
+                }
+                
+                float lambda2 = -contact.massTangent2 * vt2;
+                
+                float oldLambda2 = contact.lambda_t2;
+                contact.lambda_t2 = clamp(oldLambda2 + lambda2, -maxFriction, maxFriction);
+                lambda2 = contact.lambda_t2 - oldLambda2;
+                
+                float3 impulse2 = contact.tangent2 * lambda2;
+                
+                if (bodyA.invMass > 0)
+                {
+                    bodyA.linearVelocity -= impulse2 * bodyA.invMass;
+                    bodyA.angularVelocity -= Cross(rA, impulse2) * bodyA.invInertiaTensorWorld;
+                }
+                if (bodyB.invMass > 0)
+                {
+                    bodyB.linearVelocity += impulse2 * bodyB.invMass;
+                    bodyB.angularVelocity += Cross(rB, impulse2) * bodyB.invInertiaTensorWorld;
+                }
+            }
+            
+            // Write back
+            _Contacts[contactOffset + c] = contact;
+            _Bodies[bodyOffset + contact.bodyA] = bodyA;
+            _Bodies[bodyOffset + contact.bodyB] = bodyB;
+        }
+    }
+}
+
+// =============================================================================
+// Joint Constraint Solver
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SolveJointConstraints(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint jointOffset = envIndex * (uint)_MaxJointsPerEnv;
+    
+    for (int iter = 0; iter < _SolverIterations; iter++)
+    {
+        for (uint j = 0; j < (uint)_MaxJointsPerEnv; j++)
+        {
+            JointConstraint joint = _JointConstraints[jointOffset + j];
+            if (joint.jointType == 0) continue; // Skip fixed/inactive joints
+            
+            RigidBody bodyA = _Bodies[bodyOffset + joint.bodyA];
+            RigidBody bodyB = _Bodies[bodyOffset + joint.bodyB];
+            
+            // Transform anchor points to world space
+            float3 worldAnchorA = bodyA.position + joint.anchorA; // Simplified (should rotate)
+            float3 worldAnchorB = bodyB.position + joint.anchorB;
+            
+            float3 rA = worldAnchorA - bodyA.position;
+            float3 rB = worldAnchorB - bodyB.position;
+            
+            // =================================================================
+            // Position constraint (keep anchors together)
+            // =================================================================
+            float3 posError = worldAnchorB - worldAnchorA;
+            
+            // For each axis
+            for (int axis = 0; axis < 3; axis++)
+            {
+                float3 n = float3(axis == 0, axis == 1, axis == 2);
+                float error = posError[axis];
+                
+                if (abs(error) < 1e-6f) continue;
+                
+                float effectiveMass = ComputeEffectiveMass(
+                    n, rA, rB,
+                    bodyA.invMass, bodyB.invMass,
+                    bodyA.invInertiaTensorWorld, bodyB.invInertiaTensorWorld
+                );
+                
+                // XPBD with compliance
+                float alpha = joint.compliance / (_DeltaTime * _DeltaTime);
+                float deltLambda = -error / (effectiveMass + alpha);
+                
+                // Clamp force
+                deltLambda = clamp(deltLambda, -joint.maxForce * _DeltaTime, joint.maxForce * _DeltaTime);
+                
+                float3 impulse = n * deltLambda;
+                
+                if (bodyA.invMass > 0)
+                {
+                    bodyA.position -= impulse * bodyA.invMass;
+                }
+                if (bodyB.invMass > 0)
+                {
+                    bodyB.position += impulse * bodyB.invMass;
+                }
+            }
+            
+            // =================================================================
+            // Angular constraint (for hinge joints)
+            // =================================================================
+            if (joint.jointType == 1) // Hinge
+            {
+                // Transform axes to world space
+                float3 worldAxisA = joint.axisA; // Simplified (should rotate)
+                float3 worldAxisB = joint.axisB;
+                
+                // Compute angular error (axes should be aligned)
+                float3 angError = Cross(worldAxisA, worldAxisB);
+                
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    float error = angError[axis];
+                    if (abs(error) < 1e-6f) continue;
+                    
+                    float3 n = float3(axis == 0, axis == 1, axis == 2);
+                    
+                    // Angular effective mass
+                    float effectiveMass = dot(n * bodyA.invInertiaTensorWorld, n) +
+                                         dot(n * bodyB.invInertiaTensorWorld, n);
+                    if (effectiveMass < 1e-6f) continue;
+                    
+                    float deltLambda = -error / effectiveMass;
+                    
+                    if (bodyA.invMass > 0)
+                    {
+                        bodyA.angularVelocity -= n * deltLambda * bodyA.invInertiaTensorWorld;
+                    }
+                    if (bodyB.invMass > 0)
+                    {
+                        bodyB.angularVelocity += n * deltLambda * bodyB.invInertiaTensorWorld;
+                    }
+                }
+                
+                // =============================================================
+                // Motor/target control
+                // =============================================================
+                float angleError = joint.targetPosition - joint.currentPosition;
+                float angularVelError = 0 - dot(bodyB.angularVelocity - bodyA.angularVelocity, worldAxisA);
+                
+                float torque = joint.kp * angleError + joint.kd * angularVelError;
+                torque = clamp(torque, -joint.maxForce, joint.maxForce);
+                
+                float3 torqueVec = worldAxisA * torque * _DeltaTime;
+                
+                if (bodyA.invMass > 0)
+                {
+                    bodyA.angularVelocity -= torqueVec * bodyA.invInertiaTensorWorld;
+                }
+                if (bodyB.invMass > 0)
+                {
+                    bodyB.angularVelocity += torqueVec * bodyB.invInertiaTensorWorld;
+                }
+            }
+            
+            _Bodies[bodyOffset + joint.bodyA] = bodyA;
+            _Bodies[bodyOffset + joint.bodyB] = bodyB;
+        }
+    }
+}
+
+// =============================================================================
+// Position Constraint Solver (for XPBD position-level correction)
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SolvePositionConstraints(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_MaxBodiesPerEnv;
+    uint contactOffset = envIndex * (uint)_MaxContactsPerEnv;
+    
+    for (int iter = 0; iter < _SolverIterations / 2; iter++)
+    {
+        for (uint c = 0; c < (uint)_MaxContactsPerEnv; c++)
+        {
+            Contact contact = _Contacts[contactOffset + c];
+            if (contact.isActive == 0) continue;
+            if (contact.penetration <= _Slop) continue;
+            
+            RigidBody bodyA = _Bodies[bodyOffset + contact.bodyA];
+            RigidBody bodyB = _Bodies[bodyOffset + contact.bodyB];
+            
+            // Position correction
+            float correction = contact.penetration - _Slop;
+            float totalInvMass = bodyA.invMass + bodyB.invMass;
+            
+            if (totalInvMass <= 0) continue;
+            
+            float3 delta = contact.normal * (correction / totalInvMass);
+            
+            if (bodyA.invMass > 0)
+            {
+                bodyA.position -= delta * bodyA.invMass;
+            }
+            if (bodyB.invMass > 0)
+            {
+                bodyB.position += delta * bodyB.invMass;
+            }
+            
+            _Bodies[bodyOffset + contact.bodyA] = bodyA;
+            _Bodies[bodyOffset + contact.bodyB] = bodyB;
+        }
+    }
+}
+
+// =============================================================================
+// Accumulate Impulses (for parallel solving)
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void AccumulateImpulses(uint3 id : SV_DispatchThreadID)
+{
+    // For parallel PGS, we need to accumulate impulses per body
+    // This kernel collects all constraint impulses affecting each body
+    
+    uint bodyIdx = id.x;
+    uint totalBodies = (uint)_NumEnvironments * (uint)_MaxBodiesPerEnv;
+    if (bodyIdx >= totalBodies) return;
+    
+    float3 deltaLinVel = float3(0, 0, 0);
+    float3 deltaAngVel = float3(0, 0, 0);
+    
+    RigidBody body = _Bodies[bodyIdx];
+    uint envIndex = bodyIdx / (uint)_MaxBodiesPerEnv;
+    uint localBodyIdx = bodyIdx % (uint)_MaxBodiesPerEnv;
+    
+    // Sum contributions from all contacts involving this body
+    uint contactOffset = envIndex * (uint)_MaxContactsPerEnv;
+    
+    for (uint c = 0; c < (uint)_MaxContactsPerEnv; c++)
+    {
+        Contact contact = _Contacts[contactOffset + c];
+        if (contact.isActive == 0) continue;
+        
+        if ((uint)contact.bodyA == localBodyIdx || (uint)contact.bodyB == localBodyIdx)
+        {
+            float3 r = ((uint)contact.bodyA == localBodyIdx) ? 
+                      (contact.pointA - body.position) : 
+                      (contact.pointB - body.position);
+            
+            float3 impulse = contact.normal * contact.lambda_n +
+                            contact.tangent1 * contact.lambda_t1 +
+                            contact.tangent2 * contact.lambda_t2;
+            
+            float sign = ((uint)contact.bodyA == localBodyIdx) ? -1.0f : 1.0f;
+            
+            deltaLinVel += impulse * body.invMass * sign;
+            deltaAngVel += Cross(r, impulse) * body.invInertiaTensorWorld * sign;
+        }
+    }
+    
+    _DeltaLinearVelocity[bodyIdx] = deltaLinVel;
+    _DeltaAngularVelocity[bodyIdx] = deltaAngVel;
+}
+
+// =============================================================================
+// Apply Accumulated Impulses
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyImpulses(uint3 id : SV_DispatchThreadID)
+{
+    uint bodyIdx = id.x;
+    uint totalBodies = (uint)_NumEnvironments * (uint)_MaxBodiesPerEnv;
+    if (bodyIdx >= totalBodies) return;
+    
+    RigidBody body = _Bodies[bodyIdx];
+    
+    body.linearVelocity += _DeltaLinearVelocity[bodyIdx];
+    body.angularVelocity += _DeltaAngularVelocity[bodyIdx];
+    
+    _Bodies[bodyIdx] = body;
+}
+
+// =============================================================================
+// Compute Constraint Forces (for debugging/analysis)
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeConstraintForces(uint3 id : SV_DispatchThreadID)
+{
+    uint contactIdx = id.x;
+    if (contactIdx >= _ContactCount[0]) return;
+    
+    Contact contact = _Contacts[contactIdx];
+    if (contact.isActive == 0) return;
+    
+    // Constraint force = lambda / dt
+    float normalForce = contact.lambda_n * _InvDeltaTime;
+    float frictionForce1 = contact.lambda_t1 * _InvDeltaTime;
+    float frictionForce2 = contact.lambda_t2 * _InvDeltaTime;
+    
+    // Store for visualization/analysis
+    // (Would need additional output buffer)
+}

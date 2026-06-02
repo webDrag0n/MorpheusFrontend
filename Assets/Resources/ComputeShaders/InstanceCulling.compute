@@ -1,0 +1,138 @@
+// =============================================================================
+// Instance Culling Compute Shader
+// GPU-based frustum and distance culling for instanced rendering
+// =============================================================================
+
+#pragma kernel CullInstances
+#pragma kernel ResetCounter
+#pragma kernel CompactVisibleInstances
+
+#define THREAD_GROUP_SIZE 256
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+struct RigidBodyState
+{
+    float3 position;
+    float _padding0;
+    float4 orientation;
+    
+    float3 linearVelocity;
+    float _padding1;
+    float3 angularVelocity;
+    float _padding2;
+    
+    float mass;
+    float invMass;
+    float3 inertiaTensor;
+    float _padding3;
+    float3 invInertiaTensor;
+    float _padding4;
+    
+    int bodyIndex;
+    int envIndex;
+    uint flags;
+    float _padding5;
+};
+
+// =============================================================================
+// Buffers
+// =============================================================================
+
+StructuredBuffer<RigidBodyState> _RigidBodyStates;
+RWStructuredBuffer<uint> _Visibility;
+RWStructuredBuffer<uint> _IndirectArgs;
+RWStructuredBuffer<uint> _VisibleIndices;
+RWStructuredBuffer<uint> _Counter;
+
+// =============================================================================
+// Parameters
+// =============================================================================
+
+float4 _FrustumPlanes[6];
+float3 _CameraPosition;
+float _MaxDistance;
+float _BoundingRadius; // Radius of bounding sphere for each instance
+int _NumInstances;
+int _MaxBodiesPerEnv;
+int _BodyIndex; // Which body to check for culling
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+bool IsPointInFrustum(float3 position, float radius)
+{
+    for (int i = 0; i < 6; i++)
+    {
+        float dist = dot(_FrustumPlanes[i].xyz, position) + _FrustumPlanes[i].w;
+        if (dist < -radius)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsWithinDistance(float3 position)
+{
+    float dist = distance(position, _CameraPosition);
+    return dist < _MaxDistance;
+}
+
+// =============================================================================
+// Kernels
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CullInstances(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NumInstances) return;
+    
+    uint envIndex = id.x;
+    uint bodyStateIndex = envIndex * (uint)_MaxBodiesPerEnv + (uint)_BodyIndex;
+    
+    RigidBodyState state = _RigidBodyStates[bodyStateIndex];
+    
+    // Check if body is active
+    bool isActive = (state.flags & 1u) != 0;
+    
+    // Frustum culling
+    bool inFrustum = IsPointInFrustum(state.position, _BoundingRadius);
+    
+    // Distance culling
+    bool inRange = IsWithinDistance(state.position);
+    
+    // Final visibility
+    uint visible = (isActive && inFrustum && inRange) ? 1u : 0u;
+    
+    _Visibility[envIndex] = visible;
+    
+    // Update indirect args with atomic add
+    if (visible)
+    {
+        InterlockedAdd(_IndirectArgs[1], 1);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ResetCounter(uint3 id : SV_DispatchThreadID)
+{
+    _IndirectArgs[1] = 0;
+    _Counter[0] = 0;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CompactVisibleInstances(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NumInstances) return;
+    
+    if (_Visibility[id.x] == 1)
+    {
+        uint index;
+        InterlockedAdd(_Counter[0], 1, index);
+        _VisibleIndices[index] = id.x;
+    }
+}

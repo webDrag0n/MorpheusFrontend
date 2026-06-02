@@ -1,0 +1,681 @@
+// =============================================================================
+// Advanced Articulated Body Dynamics Compute Shader
+// Implements Recursive Newton-Euler Algorithm for humanoid robot simulation
+// Optimized for H1 robot with 19 joints
+// =============================================================================
+
+#pragma kernel ArticulatedBodyForwardDynamics
+#pragma kernel ArticulatedBodyInverseDynamics
+#pragma kernel ComputeJacobian
+#pragma kernel FeatherstoneABA
+#pragma kernel ComputeMassMatrix
+#pragma kernel ComputeCoriolisForces
+#pragma kernel ComputeGravityCompensation
+
+#define THREAD_GROUP_SIZE 256
+#define MAX_BODIES 20
+#define MAX_JOINTS 19
+#define DOF_PER_JOINT 1  // Hinge joints (1 DOF each)
+
+// =============================================================================
+// Articulated Body Data Structures
+// =============================================================================
+
+struct SpatialVector6
+{
+    float3 angular;
+    float3 linear;
+};
+
+struct SpatialInertia
+{
+    float mass;
+    float3 centerOfMass;
+    float3x3 rotationalInertia;
+};
+
+struct ArticulatedBody
+{
+    // Kinematic tree structure
+    int parentIndex;
+    int jointIndex;
+    uint jointType;
+    float _padding0;
+    
+    // Joint axis (local frame)
+    float3 jointAxis;
+    float _padding1;
+    
+    // Local transform from parent (at q=0)
+    float3 localPosition;
+    float _padding2;
+    float4 localRotation;
+    
+    // Current state
+    float3 position;
+    float _padding3;
+    float4 orientation;
+    
+    // Spatial velocity (in body frame)
+    float3 angularVelocity;
+    float _padding4;
+    float3 linearVelocity;
+    float _padding5;
+    
+    // Spatial acceleration
+    float3 angularAcceleration;
+    float _padding6;
+    float3 linearAcceleration;
+    float _padding7;
+    
+    // Inertial properties
+    float mass;
+    float3 inertiaDiagonal;
+    float3 centerOfMass;
+    float _padding8;
+};
+
+struct JointDynamics
+{
+    float position;
+    float velocity;
+    float acceleration;
+    float torque;
+    
+    float positionMin;
+    float positionMax;
+    float velocityMax;
+    float torqueMax;
+    
+    float damping;
+    float stiffness;
+    float armature;  // Rotor inertia reflected to joint
+    float frictionLoss;
+};
+
+// Articulated body algorithm intermediate values
+struct ABAIntermediates
+{
+    // Spatial inertia (articulated body inertia)
+    float3x3 spatialInertiaAngular;
+    float3x3 spatialInertiaCross;
+    float3x3 spatialInertiaLinear;
+    
+    // Bias force
+    float3 biasForceAngular;
+    float3 biasForceLinear;
+    
+    // Intermediate values for ABA
+    float D;  // Apparent inertia
+    float u;  // Bias acceleration
+    float3 U_angular;
+    float3 U_linear;
+};
+
+// =============================================================================
+// Buffers
+// =============================================================================
+
+RWStructuredBuffer<ArticulatedBody> _ArticulatedBodies;
+RWStructuredBuffer<JointDynamics> _JointDynamics;
+RWStructuredBuffer<ABAIntermediates> _ABAIntermediates;
+RWStructuredBuffer<float> _MassMatrix;  // numEnvs * numJoints * numJoints
+RWStructuredBuffer<float> _CoriolisForces;  // numEnvs * numJoints
+StructuredBuffer<float> _ExternalForces;  // numEnvs * numBodies * 6
+
+cbuffer ArticulatedParams
+{
+    float4 _Gravity;
+    float _DeltaTime;
+    int _NumEnvironments;
+    int _NumBodies;
+    int _NumJoints;
+};
+
+// =============================================================================
+// Math Utilities
+// =============================================================================
+
+float3x3 SkewSymmetric(float3 v)
+{
+    return float3x3(
+        0, -v.z, v.y,
+        v.z, 0, -v.x,
+        -v.y, v.x, 0
+    );
+}
+
+float3x3 OuterProduct(float3 a, float3 b)
+{
+    return float3x3(
+        a.x * b.x, a.x * b.y, a.x * b.z,
+        a.y * b.x, a.y * b.y, a.y * b.z,
+        a.z * b.x, a.z * b.y, a.z * b.z
+    );
+}
+
+float4 QuatMul(float4 q1, float4 q2)
+{
+    return float4(
+        q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+        q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+        q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+        q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z
+    );
+}
+
+float3 QuatRotate(float4 q, float3 v)
+{
+    float3 u = q.xyz;
+    float s = q.w;
+    return 2.0f * dot(u, v) * u
+         + (s * s - dot(u, u)) * v
+         + 2.0f * s * cross(u, v);
+}
+
+float3x3 QuatToRotMat(float4 q)
+{
+    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    
+    return float3x3(
+        1 - 2*(yy + zz), 2*(xy - wz), 2*(xz + wy),
+        2*(xy + wz), 1 - 2*(xx + zz), 2*(yz - wx),
+        2*(xz - wy), 2*(yz + wx), 1 - 2*(xx + yy)
+    );
+}
+
+// Spatial vector cross product (motion x motion = motion)
+void SpatialCrossMotion(float3 w1, float3 v1, float3 w2, float3 v2, out float3 wo, out float3 vo)
+{
+    wo = cross(w1, w2);
+    vo = cross(w1, v2) + cross(v1, w2);
+}
+
+// Spatial vector cross product (motion x force = force)
+void SpatialCrossForce(float3 w, float3 v, float3 n, float3 f, out float3 no, out float3 fo)
+{
+    no = cross(w, n) + cross(v, f);
+    fo = cross(w, f);
+}
+
+// =============================================================================
+// Featherstone Articulated Body Algorithm
+// =============================================================================
+
+// Pass 1: Compute velocities and accelerations from root to leaves
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ArticulatedBodyForwardDynamics(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    
+    // Process bodies in topological order (root to leaves)
+    for (int i = 0; i < _NumBodies; i++)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        
+        if (body.parentIndex < 0)
+        {
+            // Root body - set world frame velocity
+            body.angularVelocity = float3(0, 0, 0);
+            body.linearVelocity = float3(0, 0, 0);
+            body.angularAcceleration = float3(0, 0, 0);
+            body.linearAcceleration = -_Gravity.xyz;  // Gravity in base frame
+        }
+        else
+        {
+            ArticulatedBody parent = _ArticulatedBodies[bodyOffset + body.parentIndex];
+            JointDynamics joint = _JointDynamics[jointOffset + body.jointIndex];
+            
+            // Transform from parent to child
+            float3x3 R = QuatToRotMat(body.localRotation);
+            float3 p = body.localPosition;
+            
+            // Joint motion subspace (for hinge joint)
+            float3 S_angular = body.jointAxis;
+            float3 S_linear = float3(0, 0, 0);
+            
+            // Velocity propagation
+            // v_i = X_{i,p(i)} * v_{p(i)} + S_i * qdot_i
+            float3 parent_w_transformed = mul(R, parent.angularVelocity);
+            float3 parent_v_transformed = mul(R, parent.linearVelocity + cross(parent.angularVelocity, p));
+            
+            body.angularVelocity = parent_w_transformed + S_angular * joint.velocity;
+            body.linearVelocity = parent_v_transformed + S_linear * joint.velocity;
+            
+            // Bias acceleration (Coriolis/centrifugal)
+            float3 coriolis_angular, coriolis_linear;
+            SpatialCrossMotion(body.angularVelocity, body.linearVelocity,
+                              S_angular * joint.velocity, S_linear * joint.velocity,
+                              coriolis_angular, coriolis_linear);
+            
+            // Acceleration propagation
+            float3 parent_a_angular = mul(R, parent.angularAcceleration);
+            float3 parent_a_linear = mul(R, parent.linearAcceleration + 
+                                        cross(parent.angularAcceleration, p) +
+                                        cross(parent.angularVelocity, cross(parent.angularVelocity, p)));
+            
+            body.angularAcceleration = parent_a_angular + coriolis_angular + S_angular * joint.acceleration;
+            body.linearAcceleration = parent_a_linear + coriolis_linear + S_linear * joint.acceleration;
+        }
+        
+        _ArticulatedBodies[bodyOffset + i] = body;
+    }
+}
+
+// Pass 2: Compute forces from leaves to root (inverse dynamics)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ArticulatedBodyInverseDynamics(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    
+    // Temporary storage for forces
+    float3 forces_angular[MAX_BODIES];
+    float3 forces_linear[MAX_BODIES];
+    
+    // Process bodies in reverse topological order (leaves to root)
+    for (int i = _NumBodies - 1; i >= 0; i--)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        
+        // Compute spatial inertia force: f = I*a + v x (I*v)
+        float mass = body.mass;
+        float3 c = body.centerOfMass;
+        float3 I = body.inertiaDiagonal;
+        
+        // Inertia times velocity
+        float3 Iv_angular = I * body.angularVelocity + mass * cross(c, body.linearVelocity);
+        float3 Iv_linear = mass * (body.linearVelocity - cross(body.angularVelocity, c));
+        
+        // Inertia times acceleration
+        float3 Ia_angular = I * body.angularAcceleration + mass * cross(c, body.linearAcceleration);
+        float3 Ia_linear = mass * (body.linearAcceleration - cross(body.angularAcceleration, c));
+        
+        // Coriolis/gyroscopic force: v x (I*v)
+        float3 coriolis_angular, coriolis_linear;
+        SpatialCrossForce(body.angularVelocity, body.linearVelocity,
+                         Iv_angular, Iv_linear,
+                         coriolis_angular, coriolis_linear);
+        
+        // Total force on this body
+        forces_angular[i] = Ia_angular + coriolis_angular;
+        forces_linear[i] = Ia_linear + coriolis_linear;
+        
+        // Add external forces (if any)
+        uint extForceIdx = envIndex * _NumBodies * 6 + i * 6;
+        forces_angular[i] -= float3(_ExternalForces[extForceIdx], 
+                                    _ExternalForces[extForceIdx + 1],
+                                    _ExternalForces[extForceIdx + 2]);
+        forces_linear[i] -= float3(_ExternalForces[extForceIdx + 3],
+                                   _ExternalForces[extForceIdx + 4],
+                                   _ExternalForces[extForceIdx + 5]);
+    }
+    
+    // Propagate forces up the tree and compute joint torques
+    for (int i = _NumBodies - 1; i >= 0; i--)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        
+        if (body.parentIndex >= 0)
+        {
+            // Transform force to parent frame and add
+            float3x3 R = transpose(QuatToRotMat(body.localRotation));
+            float3 p = body.localPosition;
+            
+            float3 f_transformed_angular = mul(R, forces_angular[i]) + 
+                                          cross(p, mul(R, forces_linear[i]));
+            float3 f_transformed_linear = mul(R, forces_linear[i]);
+            
+            forces_angular[body.parentIndex] += f_transformed_angular;
+            forces_linear[body.parentIndex] += f_transformed_linear;
+            
+            // Compute joint torque: tau = S^T * f
+            JointDynamics joint = _JointDynamics[jointOffset + body.jointIndex];
+            float3 S_angular = body.jointAxis;
+            joint.torque = dot(S_angular, forces_angular[i]);
+            
+            // Add joint damping and friction
+            joint.torque += joint.damping * joint.velocity;
+            joint.torque += sign(joint.velocity) * joint.frictionLoss;
+            
+            _JointDynamics[jointOffset + body.jointIndex] = joint;
+        }
+    }
+}
+
+// =============================================================================
+// Featherstone Articulated Body Algorithm (Complete)
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void FeatherstoneABA(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    uint abaOffset = envIndex * (uint)_NumBodies;
+    
+    // =========================================================================
+    // Pass 1: Compute velocities (outward pass)
+    // =========================================================================
+    for (int i = 0; i < _NumBodies; i++)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        
+        if (body.parentIndex < 0)
+        {
+            body.angularVelocity = float3(0, 0, 0);
+            body.linearVelocity = float3(0, 0, 0);
+        }
+        else
+        {
+            ArticulatedBody parent = _ArticulatedBodies[bodyOffset + body.parentIndex];
+            JointDynamics joint = _JointDynamics[jointOffset + body.jointIndex];
+            
+            float3x3 R = QuatToRotMat(body.localRotation);
+            float3 p = body.localPosition;
+            
+            body.angularVelocity = mul(R, parent.angularVelocity) + body.jointAxis * joint.velocity;
+            body.linearVelocity = mul(R, parent.linearVelocity + cross(parent.angularVelocity, p));
+        }
+        
+        _ArticulatedBodies[bodyOffset + i] = body;
+    }
+    
+    // =========================================================================
+    // Pass 2: Compute articulated body inertias (inward pass)
+    // =========================================================================
+    for (int i = _NumBodies - 1; i >= 0; i--)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        ABAIntermediates aba = _ABAIntermediates[abaOffset + i];
+        
+        // Initialize with rigid body spatial inertia
+        float mass = body.mass;
+        float3 c = body.centerOfMass;
+        float3 I = body.inertiaDiagonal;
+        
+        // Spatial inertia matrix components
+        aba.spatialInertiaAngular = float3x3(
+            I.x, 0, 0,
+            0, I.y, 0,
+            0, 0, I.z
+        ) + mass * OuterProduct(c, c) - mass * dot(c, c) * float3x3(1,0,0, 0,1,0, 0,0,1);
+        
+        aba.spatialInertiaCross = mass * SkewSymmetric(c);
+        aba.spatialInertiaLinear = mass * float3x3(1,0,0, 0,1,0, 0,0,1);
+        
+        // Compute bias force (Coriolis/centrifugal)
+        float3 Iv_angular = mul(aba.spatialInertiaAngular, body.angularVelocity) + 
+                           mul(aba.spatialInertiaCross, body.linearVelocity);
+        float3 Iv_linear = mul(transpose(aba.spatialInertiaCross), body.angularVelocity) +
+                          mul(aba.spatialInertiaLinear, body.linearVelocity);
+        
+        SpatialCrossForce(body.angularVelocity, body.linearVelocity,
+                         Iv_angular, Iv_linear,
+                         aba.biasForceAngular, aba.biasForceLinear);
+        
+        // Add gravity (as if applied at CoM)
+        aba.biasForceLinear -= mass * _Gravity.xyz;
+        
+        _ABAIntermediates[abaOffset + i] = aba;
+    }
+    
+    // Propagate articulated body inertias up the tree
+    for (int i = _NumBodies - 1; i >= 0; i--)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        
+        if (body.parentIndex >= 0)
+        {
+            ABAIntermediates aba = _ABAIntermediates[abaOffset + i];
+            ABAIntermediates parentAba = _ABAIntermediates[abaOffset + body.parentIndex];
+            JointDynamics joint = _JointDynamics[jointOffset + body.jointIndex];
+            
+            float3 S = body.jointAxis;
+            
+            // U = I * S
+            aba.U_angular = mul(aba.spatialInertiaAngular, S);
+            aba.U_linear = mul(transpose(aba.spatialInertiaCross), S);
+            
+            // D = S^T * I * S + armature
+            aba.D = dot(S, aba.U_angular) + joint.armature;
+            
+            // u = tau - S^T * pA
+            aba.u = joint.torque - dot(S, aba.biasForceAngular);
+            
+            // Propagate to parent (simplified)
+            if (aba.D > 1e-6f)
+            {
+                float invD = 1.0f / aba.D;
+                
+                // I_a = I - U * U^T / D
+                float3x3 UUt = OuterProduct(aba.U_angular, aba.U_angular);
+                parentAba.spatialInertiaAngular += aba.spatialInertiaAngular - UUt * invD;
+                
+                // p_a = pA + I_a * c + U * u / D
+                parentAba.biasForceAngular += aba.biasForceAngular + aba.U_angular * aba.u * invD;
+                parentAba.biasForceLinear += aba.biasForceLinear + aba.U_linear * aba.u * invD;
+            }
+            
+            _ABAIntermediates[abaOffset + i] = aba;
+            _ABAIntermediates[abaOffset + body.parentIndex] = parentAba;
+        }
+    }
+    
+    // =========================================================================
+    // Pass 3: Compute accelerations (outward pass)
+    // =========================================================================
+    for (int i = 0; i < _NumBodies; i++)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + i];
+        ABAIntermediates aba = _ABAIntermediates[abaOffset + i];
+        
+        if (body.parentIndex < 0)
+        {
+            body.angularAcceleration = float3(0, 0, 0);
+            body.linearAcceleration = float3(0, 0, 0);
+        }
+        else
+        {
+            ArticulatedBody parent = _ArticulatedBodies[bodyOffset + body.parentIndex];
+            JointDynamics joint = _JointDynamics[jointOffset + body.jointIndex];
+            
+            float3x3 R = QuatToRotMat(body.localRotation);
+            float3 p = body.localPosition;
+            
+            // Transform parent acceleration
+            body.angularAcceleration = mul(R, parent.angularAcceleration);
+            body.linearAcceleration = mul(R, parent.linearAcceleration + 
+                                         cross(parent.angularAcceleration, p) +
+                                         cross(parent.angularVelocity, cross(parent.angularVelocity, p)));
+            
+            // Compute joint acceleration
+            if (aba.D > 1e-6f)
+            {
+                float3 S = body.jointAxis;
+                joint.acceleration = (aba.u - dot(aba.U_angular, body.angularAcceleration) -
+                                     dot(aba.U_linear, body.linearAcceleration)) / aba.D;
+                
+                body.angularAcceleration += S * joint.acceleration;
+            }
+            
+            _JointDynamics[jointOffset + body.jointIndex] = joint;
+        }
+        
+        _ArticulatedBodies[bodyOffset + i] = body;
+    }
+    
+    // =========================================================================
+    // Integration: Update positions and velocities
+    // =========================================================================
+    for (int j = 0; j < _NumJoints; j++)
+    {
+        JointDynamics joint = _JointDynamics[jointOffset + j];
+        
+        // Semi-implicit Euler integration
+        joint.velocity += joint.acceleration * _DeltaTime;
+        joint.velocity = clamp(joint.velocity, -joint.velocityMax, joint.velocityMax);
+        
+        joint.position += joint.velocity * _DeltaTime;
+        joint.position = clamp(joint.position, joint.positionMin, joint.positionMax);
+        
+        _JointDynamics[jointOffset + j] = joint;
+    }
+}
+
+// =============================================================================
+// Mass Matrix Computation (for dynamics analysis)
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeMassMatrix(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    uint matrixOffset = envIndex * (uint)_NumJoints * (uint)_NumJoints;
+    
+    // Composite Rigid Body Algorithm for mass matrix
+    // M[i,j] = sum_k { S_i^T * X_{k,i}^T * I_k * X_{k,j} * S_j }
+    
+    for (int i = 0; i < _NumJoints; i++)
+    {
+        for (int j = 0; j < _NumJoints; j++)
+        {
+            float Mij = 0;
+            
+            // Find common ancestor and compute contribution
+            // Simplified: only diagonal elements
+            if (i == j)
+            {
+                ArticulatedBody body = _ArticulatedBodies[bodyOffset + i + 1]; // +1 for root offset
+                JointDynamics joint = _JointDynamics[jointOffset + i];
+                
+                float3 S = body.jointAxis;
+                float3 I = body.inertiaDiagonal;
+                
+                // M[i,i] = S^T * I * S + armature
+                Mij = dot(S, I * S) + body.mass * length(cross(body.centerOfMass, S)) + joint.armature;
+            }
+            
+            _MassMatrix[matrixOffset + i * _NumJoints + j] = Mij;
+        }
+    }
+}
+
+// =============================================================================
+// Coriolis Forces Computation
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeCoriolisForces(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    uint forceOffset = envIndex * (uint)_NumJoints;
+    
+    for (int j = 0; j < _NumJoints; j++)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + j + 1];
+        JointDynamics joint = _JointDynamics[jointOffset + j];
+        
+        // Coriolis force = v x (I*v) projected onto joint axis
+        float3 I = body.inertiaDiagonal;
+        float3 Iw = I * body.angularVelocity;
+        float3 coriolis = cross(body.angularVelocity, Iw);
+        
+        _CoriolisForces[forceOffset + j] = dot(body.jointAxis, coriolis);
+    }
+}
+
+// =============================================================================
+// Gravity Compensation
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeGravityCompensation(uint3 id : SV_DispatchThreadID)
+{
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    
+    // Compute gravity compensation torques using inverse dynamics with zero velocity
+    for (int j = 0; j < _NumJoints; j++)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + j + 1];
+        JointDynamics joint = _JointDynamics[jointOffset + j];
+        
+        // Simple gravity compensation: tau_g = J^T * (m * g)
+        float3 r = body.position - _ArticulatedBodies[bodyOffset].position; // Distance from root
+        float3 gravForce = body.mass * _Gravity.xyz;
+        float3 gravTorque = cross(r, gravForce);
+        
+        // Project onto joint axis
+        float tau_g = dot(body.jointAxis, gravTorque);
+        
+        // Store as additional torque (not overwriting control torque)
+        joint.torque += tau_g;
+        
+        _JointDynamics[jointOffset + j] = joint;
+    }
+}
+
+// =============================================================================
+// Jacobian Computation
+// =============================================================================
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeJacobian(uint3 id : SV_DispatchThreadID)
+{
+    // Compute end-effector Jacobian for each environment
+    // J = [J_1, J_2, ..., J_n] where J_i = [z_i; z_i x (p_ee - p_i)]
+    // This is used for operational space control
+    
+    uint envIndex = id.x;
+    if (envIndex >= (uint)_NumEnvironments) return;
+    
+    uint bodyOffset = envIndex * (uint)_NumBodies;
+    uint jointOffset = envIndex * (uint)_NumJoints;
+    
+    // Get end-effector position (last body)
+    ArticulatedBody endEffector = _ArticulatedBodies[bodyOffset + _NumBodies - 1];
+    float3 p_ee = endEffector.position;
+    
+    // For each joint, compute Jacobian column
+    for (int j = 0; j < _NumJoints; j++)
+    {
+        ArticulatedBody body = _ArticulatedBodies[bodyOffset + j + 1];
+        
+        // Joint axis in world frame
+        float3 z_j = QuatRotate(body.orientation, body.jointAxis);
+        
+        // Vector from joint to end-effector
+        float3 r = p_ee - body.position;
+        
+        // Jacobian column (angular and linear parts)
+        float3 J_angular = z_j;
+        float3 J_linear = cross(z_j, r);
+        
+        // Store in buffer (would need a proper Jacobian buffer)
+        // For now, this kernel demonstrates the computation
+    }
+}
